@@ -41,4 +41,4 @@ Pushing a tag like `v1.0.0` runs [`release.yml`](.github/workflows/release.yml),
 - `<dir>/Makefile` makes it a TUI tool. CI runs `make` and publishes a universal (arm64 + x86_64) `<dir>-macos.tar.gz` with a `.sha256`.
 - `<dir>/scripts/build-dmg.sh` makes it a GUI app. CI runs `scripts/test.sh` if present, then the script, and publishes the DMG with a `.sha256`.
 
-To add a tool, create a folder following one of these conventions; no workflow or installer changes are needed. The workflow also publishes `tui-tools.txt` and `gui-apps.txt`, which the installers read.
+The workflow also publishes `tui-tools.txt` and `gui-apps.txt`, which the installers read.
