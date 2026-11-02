@@ -58,34 +58,28 @@ without a device grabbing the session.
 SwiftUI previews are the fastest way to iterate on UI: `Kind/UI/PreviewSupport.swift` builds a
 populated fake library. Previews also never connect to hardware.
 
-### Releases
+### Install
 
-The repo-root workflow `.github/workflows/release.yml` builds a universal (Apple silicon + Intel),
-**ad-hoc signed** DMG on GitHub's `macos-26` runners, after running `scripts/test.sh`. Kind shares
-its release with the other FutureGadgets tools: one version tag publishes everything.
+Kind is not published as a binary. The repo-root installer clones this repo, builds Kind with
+Xcode for this Mac's architecture and copies it to `/Applications`:
 
-- **Publish a release:** push a version tag from the repo root. The release gets `Kind-1.2.0.dmg`
-  and its SHA-256 checksum.
-  ```sh
-  git tag v1.2.0 && git push origin v1.2.0
-  ```
-- **Test build only:** run the workflow manually (*Actions → Release → Run workflow*). The
-  DMG is attached to the run as an artifact, versioned `0.0.<run number>`.
-- **Install from a release:** `curl -fsSL https://raw.githubusercontent.com/buzzer-re/FutureGadgets/main/install-gui.sh | sh`
-- **Build locally:** `scripts/build-dmg.sh 1.2.0` writes `build/Kind-1.2.0.dmg`.
+```sh
+curl -fsSL https://raw.githubusercontent.com/buzzer-re/FutureGadgets/main/install-gui.sh | sh
+```
 
-Ad-hoc builds aren't notarized, so Gatekeeper blocks the first launch. Users allow the app under
-*System Settings → Privacy & Security → Open Anyway*. Distributing without that step needs a
-Developer ID certificate and notarization.
+To build without installing, run `scripts/build-app.sh` (writes `build/Kind.app`). The build is
+ad-hoc signed, which needs no Apple Developer account. A locally built app has no quarantine
+flag, so Gatekeeper lets it open.
 
 ### Update checks
 
 Kind checks `api.github.com/repos/buzzer-re/FutureGadgets/releases/latest` a few seconds after launch,
 then every 12 hours (and from *Kind → Check for Updates…*). When the latest release tag is newer
 than the running version, a card appears at the bottom of the sidebar. From there the user can
-read the release notes, skip that version, or download the update. The DMG is saved to
-Downloads, checked against the release's `.sha256` file and opened. The user then quits Kind and
-drags the new copy over the old one.
+read the release notes, skip that version, or download the update. Releases here carry no DMG, so
+*download* opens the release page; update by running the installer again. (When a release does
+include a `.dmg`, Kind saves it to Downloads, checks it against the release's `.sha256` file and
+opens it.)
 
 - The repository and its releases must be **public**. The check runs without a token, and private
   repositories answer 404, which Kind reports as "no releases".

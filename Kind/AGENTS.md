@@ -113,7 +113,8 @@ These all caused real failures. Don't regress them.
 
 - `UpdateChecker` asks GitHub's `releases/latest` API, compares the tag with
   `CFBundleShortVersionString` using `AppVersion`, and downloads the release's `.dmg` with its
-  `.sha256` checksum. These asset names come from `scripts/build-dmg.sh`, so keep the two in sync.
+  `.sha256` checksum when a release has one. Releases of this repo ship no DMG, so the checker
+  falls back to opening the release page.
 - Automatic checks are off in previews, under XCTest and with `-KindDisableUpdateCheck` (the UI
   tests pass it). Keep test and preview runs off the network.
 

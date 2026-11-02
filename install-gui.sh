@@ -1,27 +1,25 @@
 #!/bin/sh
-# Installs the FutureGadgets GUI apps (macOS .app bundles) from the latest GitHub Release.
+# Builds and installs the FutureGadgets GUI apps from source, on this Mac.
 #
 #   curl -fsSL https://raw.githubusercontent.com/buzzer-re/FutureGadgets/main/install-gui.sh | sh
 #   curl -fsSL .../install-gui.sh | sh -s -- Kind       # only some apps
 #
+# Needs git and Xcode (xcodebuild). Clones the repo into a temp folder, runs each app's
+# scripts/build-app.sh, copies the .app into place and deletes the clone.
+#
 # Environment:
 #   APP_DIR  where to put the apps   (default: /Applications, or ~/Applications if not writable)
-#   VERSION  release to install, e.g. 1.2.0   (default: latest)
-#
-# Builds are ad-hoc signed, not notarized, so the quarantine flag is cleared after install.
+#   REF      branch or tag to build  (default: main)
 set -eu
 
-REPO="buzzer-re/FutureGadgets"
-
-if [ -n "${VERSION:-}" ]; then
-  BASE="https://github.com/$REPO/releases/download/v${VERSION#v}"
-else
-  BASE="https://github.com/$REPO/releases/latest/download"
-fi
+REPO_URL="https://github.com/buzzer-re/FutureGadgets.git"
+REF="${REF:-main}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
 [ "$(uname -s)" = Darwin ] || die "these apps are macOS only"
+command -v git >/dev/null || die "git not found (run: xcode-select --install)"
+xcodebuild -version >/dev/null 2>&1 || die "Xcode not found. Install it from the App Store, then run: sudo xcode-select -s /Applications/Xcode.app"
 
 if [ -z "${APP_DIR:-}" ]; then
   if [ -w /Applications ]; then APP_DIR=/Applications; else APP_DIR="$HOME/Applications"; fi
@@ -29,32 +27,27 @@ fi
 mkdir -p "$APP_DIR"
 
 TMP="$(mktemp -d)"
-MNT="$TMP/mnt"
-cleanup() {
-  hdiutil detach "$MNT" -quiet 2>/dev/null || true
-  rm -rf "$TMP"
-}
-trap cleanup EXIT
+trap 'rm -rf "$TMP"' EXIT
 
-fetch() { curl -fsSL "$BASE/$1" -o "$TMP/$1" || die "cannot download $BASE/$1"; }
+echo "==> Cloning $REPO_URL ($REF)"
+git clone --quiet --depth 1 --branch "$REF" "$REPO_URL" "$TMP/src" </dev/null
 
-# gui-apps.txt: one "<App> <dmg file>" per line.
-fetch gui-apps.txt
-while read -r app dmg; do
-  [ -n "$app" ] || continue
-  if [ $# -gt 0 ]; then
-    case " $* " in *" $app "*) ;; *) continue ;; esac
-  fi
-  echo "==> $app"
-  fetch "$dmg"
-  fetch "$dmg.sha256"
-  (cd "$TMP" && shasum -a 256 -c "$dmg.sha256" >/dev/null) || die "checksum mismatch for $dmg"
-  mkdir -p "$MNT"
-  hdiutil attach "$TMP/$dmg" -nobrowse -readonly -quiet -mountpoint "$MNT" </dev/null || die "cannot mount $dmg"
-  [ -d "$MNT/$app.app" ] || die "$app.app not found in $dmg"
+# A GUI app is any top-level folder with scripts/build-app.sh; the folder name is the app name.
+APPS="$*"
+if [ -z "$APPS" ]; then
+  for script in "$TMP"/src/*/scripts/build-app.sh; do
+    [ -e "$script" ] || continue
+    APPS="$APPS $(basename "$(dirname "$(dirname "$script")")")"
+  done
+fi
+[ -n "$APPS" ] || die "no GUI apps found"
+
+for app in $APPS; do
+  script="$TMP/src/$app/scripts/build-app.sh"
+  [ -x "$script" ] || die "unknown app: $app"
+  echo "==> Building $app"
+  "$script" "$TMP/out/$app" </dev/null
   rm -rf "$APP_DIR/$app.app"
-  ditto "$MNT/$app.app" "$APP_DIR/$app.app"
-  hdiutil detach "$MNT" -quiet
-  xattr -dr com.apple.quarantine "$APP_DIR/$app.app" 2>/dev/null || true
+  ditto "$TMP/out/$app/$app.app" "$APP_DIR/$app.app"
   echo "    installed $APP_DIR/$app.app"
-done < "$TMP/gui-apps.txt"
+done
