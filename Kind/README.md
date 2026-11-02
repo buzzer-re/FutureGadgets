@@ -4,6 +4,8 @@ Plug in a Kindle and browse, add, edit and export its books. No Android File Tra
 Calibre or other third-party code: the MTP driver, the book parsers and the Kindle sidecar
 decoder are all written from scratch in this project.
 
+![Kind](screenshot.png)
+
 ## How it talks to the Kindle
 
 | Kindle | Transport | Code |
