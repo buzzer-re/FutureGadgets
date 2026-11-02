@@ -10,7 +10,7 @@ A collection of tools I built to solve random problems and improve quality of li
 
 ## Install
 
-Terminal tools: downloads the release binaries (all of them, into `~/.local/bin`):
+Terminal tools (all of them, into `~/.local/bin`). From a clone this compiles them; otherwise it downloads the release binaries:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/buzzer-re/FutureGadgets/main/install.sh | sh
@@ -22,7 +22,7 @@ GUI apps: clones this repo, builds with Xcode and installs into `/Applications` 
 curl -fsSL https://raw.githubusercontent.com/buzzer-re/FutureGadgets/main/install-gui.sh | sh
 ```
 
-Both accept tool names to install only some (`... | sh -s -- mhtop`). `install.sh` honors `PREFIX` and `VERSION` (pin a release, e.g. `VERSION=1.0.0`). `install-gui.sh` honors `APP_DIR` and `REF` (branch or tag to build).
+Both accept tool names to install only some (`... | sh -s -- mhtop`). `install.sh` honors `PREFIX` and, when downloading, `VERSION` (pin a release, e.g. `VERSION=1.0.0`). `install-gui.sh` honors `APP_DIR` and `REF` (branch or tag to build).
 
 ## Build from source
 
@@ -33,9 +33,3 @@ make -C mhtop          # TUI tools: produces ./<tool>/<tool>
 make -C macdirstat
 Kind/scripts/build-app.sh   # GUI apps: produces Kind/build/Kind.app
 ```
-
-## Releases
-
-Pushing a tag like `v1.0.0` runs [`release.yml`](.github/workflows/release.yml). Every folder with a `Makefile` is built as a universal (arm64 + x86_64) binary and published as `<dir>-macos.tar.gz` with a `.sha256`. The workflow also publishes `tui-tools.txt`, which `install.sh` reads.
-
-GUI apps are not released. Any folder with `scripts/build-app.sh` is picked up by `install-gui.sh`.
