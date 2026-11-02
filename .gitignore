@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Build products: releases are built by CI, the repo is source only
+/macdirstat/macdirstat
+/mhtop/mhtop
+build/
+DerivedData/
+*.o
+*.dmg

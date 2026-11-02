@@ -1,0 +1,166 @@
+name: Release
+
+# Convention-driven: no tool is listed here.
+#   <dir>/Makefile               -> TUI tool; `make` must produce ./<dir>/<dir>
+#   <dir>/scripts/build-dmg.sh   -> GUI app; script takes a version and writes build/<App>-<version>.dmg
+#
+# Push a tag like `v1.2.0` to publish a GitHub Release with every tool attached.
+# Run manually (Actions -> Release -> Run workflow) to get the builds as artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tui: ${{ steps.meta.outputs.tui }}
+      gui: ${{ steps.meta.outputs.gui }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.${GITHUB_RUN_NUMBER}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+            echo "::error::Version '$version' must look like 1, 1.2 or 1.2.3 (tag as v1.2.3)."
+            exit 1
+          fi
+          json() { if (($#)); then printf '%s\n' "$@" | jq -R . | jq -sc .; else echo '[]'; fi; }
+          tui=$(for d in */; do [[ -f "${d}Makefile" ]] && echo "${d%/}"; done || true)
+          gui=$(for d in */; do [[ -f "${d}scripts/build-dmg.sh" ]] && echo "${d%/}"; done || true)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tui=$(json $tui)" >> "$GITHUB_OUTPUT"
+          echo "gui=$(json $gui)" >> "$GITHUB_OUTPUT"
+
+  tui:
+    needs: discover
+    if: needs.discover.outputs.tui != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: ${{ fromJSON(needs.discover.outputs.tui) }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Passed through the environment so each Makefile's own `CFLAGS +=` still applies.
+      - name: Build universal binary
+        working-directory: ${{ matrix.tool }}
+        env:
+          CFLAGS: -O2 -arch arm64 -arch x86_64
+        run: |
+          make
+          lipo -info "${{ matrix.tool }}"
+
+      - name: Package
+        run: |
+          tar -czf "${{ matrix.tool }}-macos.tar.gz" -C "${{ matrix.tool }}" "${{ matrix.tool }}"
+          shasum -a 256 "${{ matrix.tool }}-macos.tar.gz" > "${{ matrix.tool }}-macos.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tui-${{ matrix.tool }}
+          path: ${{ matrix.tool }}-macos.tar.gz*
+          if-no-files-found: error
+
+  gui:
+    needs: discover
+    if: needs.discover.outputs.gui != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.discover.outputs.gui) }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcodebuild -version
+
+      - name: Test
+        working-directory: ${{ matrix.app }}
+        run: '[[ ! -x scripts/test.sh ]] || scripts/test.sh'
+
+      - name: Build DMG
+        working-directory: ${{ matrix.app }}
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: scripts/build-dmg.sh "${{ needs.discover.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-${{ matrix.app }}
+          path: |
+            ${{ matrix.app }}/build/*.dmg
+            ${{ matrix.app }}/build/*.dmg.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [discover, tui, gui]
+    # Run when either side was skipped for having no tools, but never after a failure.
+    if: >-
+      github.ref_type == 'tag' && !cancelled() &&
+      !contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Manifests the installers read: one tool per line.
+      - name: Write manifests and notes
+        env:
+          VERSION: ${{ needs.discover.outputs.version }}
+        run: |
+          cd dist
+          for f in *-macos.tar.gz; do [[ -e $f ]] && echo "${f%-macos.tar.gz}"; done > tui-tools.txt || true
+          for f in *-"$VERSION".dmg; do [[ -e $f ]] && echo "${f%-"$VERSION".dmg} $f"; done > gui-apps.txt || true
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF2'
+          ## Install
+
+          Terminal tools (`~/.local/bin`, universal binaries):
+
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+          ```
+
+          GUI apps (`/Applications`):
+
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install-gui.sh | sh
+          ```
+
+          GUI builds are ad-hoc signed, not notarized; the installer clears the quarantine flag.
+          EOF2
+          ls -l
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --generate-notes \
+            --verify-tag
