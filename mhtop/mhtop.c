@@ -817,7 +817,10 @@ static void update_proc(const struct kinfo_proc *k, double now)
 
 #define HIST 512
 
-typedef struct { pid_t pid; uint64_t ns; } GpuUse;
+/* One accelerator user client with GPU work: accumulated GPU time, last
+ * submission (ns of mach_absolute_time), command queues, APIs used. */
+typedef struct { pid_t pid; uint64_t ns, last; int queues, qmax; unsigned api; } GpuUse;
+enum { API_METAL = 1, API_GL = 2, API_CL = 4, API_OTHER = 8 };
 
 static struct {
     mach_port_t host;
@@ -835,8 +838,9 @@ static struct {
     char model[64], osver[32], host_name[64];
     /* gpu */
     int has_gpu;
-    double gpu_util;
-    uint64_t gpu_mem;
+    double gpu_util, gpu_rend, gpu_tiler; /* rend/tiler in %, -1 unknown */
+    uint64_t gpu_mem, gpu_alloc, gpu_drv, gpu_pb, gpu_tiled;
+    int64_t gpu_split, gpu_recov;
     char gpu_name[64];
     GpuUse *gu;
     size_t ngu, gucap;
@@ -990,33 +994,40 @@ static void cfstr_get(CFTypeRef s, char *o, size_t sz)
         o[0] = 0;
 }
 
-static void gu_add(pid_t pid, uint64_t ns)
+static void gu_add(const GpuUse *u)
 {
     if (S.ngu == S.gucap) {
         S.gucap = S.gucap ? S.gucap * 2 : 128;
         S.gu = xrealloc(S.gu, S.gucap * sizeof *S.gu);
     }
-    S.gu[S.ngu].pid = pid;
-    S.gu[S.ngu].ns = ns;
-    S.ngu++;
+    S.gu[S.ngu++] = *u;
 }
 
-/* GPU: device utilisation from IOAccelerator, per-process accumulated GPU
- * time from each accelerator user client's "AppUsage". */
+/* GPU: device utilisation and memory from IOAccelerator, per-process
+ * accumulated GPU time from each accelerator user client's "AppUsage". */
 static void sample_gpu(void)
 {
     io_iterator_t it, kids;
     io_object_t acc, cl;
-    double util = -1;
+    double util = -1, rend = -1, tiler = -1;
     S.ngu = 0;
     if (IOServiceGetMatchingServices(MACH_PORT_NULL, IOServiceMatching("IOAccelerator"), &it) != KERN_SUCCESS) return;
     while ((acc = IOIteratorNext(it))) {
         CFTypeRef ps = reg_prop(acc, "PerformanceStatistics");
         if (ps) {
-            int64_t u = dict_i64(ps, "Device Utilization %", -1);
+            int64_t u = dict_i64(ps, "Device Utilization %", -1), r = dict_i64(ps, "Renderer Utilization %", -1);
+            int64_t t = dict_i64(ps, "Tiler Utilization %", -1);
             if (u < 0) u = dict_i64(ps, "GPU Activity(%)", -1);
             if (u >= 0 && (double)u > util) util = (double)u;
+            if (r >= 0 && (double)r > rend) rend = (double)r;
+            if (t >= 0 && (double)t > tiler) tiler = (double)t;
             S.gpu_mem = (uint64_t)dict_i64(ps, "In use system memory", 0);
+            S.gpu_alloc = (uint64_t)dict_i64(ps, "Alloc system memory", 0);
+            S.gpu_drv = (uint64_t)dict_i64(ps, "In use system memory (driver)", 0);
+            S.gpu_pb = (uint64_t)dict_i64(ps, "Allocated PB Size", 0);
+            S.gpu_tiled = (uint64_t)dict_i64(ps, "TiledSceneBytes", 0);
+            S.gpu_split = dict_i64(ps, "SplitSceneCount", 0);
+            S.gpu_recov = dict_i64(ps, "recoveryCount", 0);
             CFRelease(ps);
         }
         if (!S.gpu_name[0]) {
@@ -1040,10 +1051,23 @@ static void sample_gpu(void)
                 if (sscanf(who, "pid %d", &pid) == 1 && pid >= 0 && (au = reg_prop(cl, "AppUsage"))) {
                     if (CFGetTypeID(au) == CFArrayGetTypeID()) {
                         CFIndex i, n = CFArrayGetCount(au);
-                        uint64_t ns = 0;
-                        for (i = 0; i < n; i++)
-                            ns += (uint64_t)dict_i64(CFArrayGetValueAtIndex(au, i), "accumulatedGPUTime", 0);
-                        if (ns) gu_add(pid, ns);
+                        GpuUse u = { pid, 0, 0, 0, 0, 0 };
+                        for (i = 0; i < n; i++) {
+                            CFDictionaryRef d = CFArrayGetValueAtIndex(au, i);
+                            uint64_t l = (uint64_t)dict_i64(d, "lastSubmittedTime", 0);
+                            char api[32];
+                            u.ns += (uint64_t)dict_i64(d, "accumulatedGPUTime", 0);
+                            if (l > u.last) u.last = l;
+                            if (CFGetTypeID(d) != CFDictionaryGetTypeID()) continue;
+                            cfstr_get(CFDictionaryGetValue(d, CFSTR("API")), api, sizeof api);
+                            u.api |= !strcmp(api, "Metal") ? API_METAL : !strcmp(api, "OpenGL") ? API_GL
+                                   : !strcmp(api, "OpenCL") ? API_CL : api[0] ? API_OTHER : 0;
+                        }
+                        if (u.ns) {
+                            u.queues = (int)reg_i64(cl, "CommandQueueCount", 0);
+                            u.qmax = (int)reg_i64(cl, "CommandQueueCountMax", 0);
+                            gu_add(&u);
+                        }
                     }
                     CFRelease(au);
                 }
@@ -1056,6 +1080,8 @@ static void sample_gpu(void)
     IOObjectRelease(it);
     S.has_gpu = util >= 0;
     S.gpu_util = util >= 0 ? util / 100.0 : 0;
+    S.gpu_rend = rend;
+    S.gpu_tiler = tiler;
 }
 
 /* Battery keys move between macOS releases: some live at the top level of
@@ -1222,6 +1248,950 @@ static void sys_init(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* GPU telemetry (GPU view and --gpu)                                  */
+/* ------------------------------------------------------------------ */
+
+/* libIOReport: a macOS system library without a public header. */
+typedef struct IOReportSubscription *IOReportSubscriptionRef;
+CFDictionaryRef IOReportCopyChannelsInGroup(CFStringRef group, CFStringRef subgroup, uint64_t a, uint64_t b, uint64_t c);
+void IOReportMergeChannels(CFDictionaryRef dst, CFDictionaryRef src, CFTypeRef unused);
+IOReportSubscriptionRef IOReportCreateSubscription(void *a, CFMutableDictionaryRef desired, CFMutableDictionaryRef *subbed,
+                                                   uint64_t id, CFTypeRef b);
+CFDictionaryRef IOReportCreateSamples(IOReportSubscriptionRef sub, CFMutableDictionaryRef subbed, CFTypeRef unused);
+CFDictionaryRef IOReportCreateSamplesDelta(CFDictionaryRef a, CFDictionaryRef b, CFTypeRef unused);
+CFStringRef IOReportChannelGetGroup(CFDictionaryRef ch);
+CFStringRef IOReportChannelGetSubGroup(CFDictionaryRef ch);
+CFStringRef IOReportChannelGetChannelName(CFDictionaryRef ch);
+CFStringRef IOReportChannelGetUnitLabel(CFDictionaryRef ch);
+int IOReportChannelGetFormat(CFDictionaryRef ch);
+int64_t IOReportSimpleGetIntegerValue(CFDictionaryRef ch, int32_t unused);
+int32_t IOReportStateGetCount(CFDictionaryRef ch);
+CFStringRef IOReportStateGetNameForIndex(CFDictionaryRef ch, int32_t i);
+int64_t IOReportStateGetResidency(CFDictionaryRef ch, int32_t i);
+
+#define GHIST 512  /* system GPU history samples (stats window) */
+#define GPH 240    /* per-process GPU history samples */
+#define GNS 40     /* states kept per IOReport state channel */
+#define GNEV 128   /* event log entries */
+#define GMAXCL 512 /* tracked GPU client processes */
+
+enum { GM_UTIL, GM_REND, GM_TILER, GM_ACTIVE, GM_FREQ, GM_POWER, GM_TEMP, GM_TMAX, GM_MEM, GM_BW, GM_DRAMW, GM_N };
+static const struct { const char *key, *name; } GMDEF[GM_N] = {
+    { "device_util_pct", "Device" },        { "renderer_util_pct", "Renderer" }, { "tiler_util_pct", "Tiler" },
+    { "active_residency_pct", "Active" },   { "clock_mhz", "Clock" },            { "gpu_power_w", "Power" },
+    { "temp_avg_c", "Temp" },               { "temp_max_c", "Temp max" },        { "gpu_mem_in_use_bytes", "GPU memory" },
+    { "dram_bandwidth_gbs", "DRAM bandwidth" }, { "dram_power_w", "DRAM power" },
+};
+
+/* One metric: history ring (shared position G.hpos) and stats since reset. */
+typedef struct { float h[GHIST]; double cur, sum, mn, mx, p95; long n; int ok; } GMet;
+/* An IOReport state channel: residency per state this sample and since reset. */
+typedef struct { int n; char name[GNS][16]; double res[GNS], cum[GNS], tot, cumtot; } GStates;
+
+typedef struct {
+    pid_t pid;
+    long start_s, start_us;
+    char name[96];
+    int alive, fresh, nclients, queues, qmax;
+    unsigned api, gen;
+    double first_t, t_prev, gone_t, cur, peak, est_w;
+    uint64_t ns, ns0, ns_prev, last_sub, phys;
+    int64_t gfx, gfx_peak;
+    float hist[GPH];
+    int hn;
+} GClient;
+
+typedef struct { time_t t; int sev; char s[160]; } GEvent; /* sev: 0 info, 1 warning, 2 fault */
+
+enum { GT_OVER, GT_PROC, GT_CLOCK, GT_MEM, GT_EVENTS, GT_N };
+static const char *GT_LABEL[GT_N] = { "Overview", "Processes", "Clocks & Power", "Memory & Bandwidth", "Events" };
+enum { GS_NOW, GS_AVG, GS_TIME, GS_GFX, GS_PID, GS_N };
+static const char *GS_LABEL[GS_N] = { "GPU% now", "average GPU%", "GPU time", "graphics memory", "PID" };
+
+static struct {
+    int active, primed, on, tab, scroll, total, view_h, sort, sel, top, list_y, list_h, tab_y, tab_x[GT_N + 1];
+    double t0, t_reset, t_last, t_ior, click_t;
+    int click_row;
+    pid_t sel_pid;
+    const char *query; /* -p: preferred focus when none is pinned */
+    /* device */
+    char name[64], family[32], driver[32], metal[48];
+    int cores, mgpus;
+    double freq[GNS], fmax;
+    int nfreq;
+    long wired_mb;
+    /* IOReport */
+    IOReportSubscriptionRef sub;
+    CFMutableDictionaryRef subbed;
+    CFDictionaryRef prev;
+    int ior;
+    /* SMC GPU temperature keys */
+    io_connect_t smc;
+    uint32_t tkey[128];
+    int ntk;
+    /* this sample */
+    double active_res, mhz, gpu_w, dram_w, ane_w, cpu_w, temp, tmax, bw_rd, bw_wr, lat, ppm;
+    int has_gpu_w, has_dram_w, has_ane_w, has_cpu_w, has_freq, has_temp, has_bw, has_lat, has_ppm, ntemp;
+    long throttle, restarts, uvwarn;
+    GStates ps, pc, cltm, pmu, pz;
+    /* since reset */
+    double energy_j, dram_j, tmax_peak;
+    long throttle_tot, restarts_tot, uvwarn_tot, samples;
+    GMet m[GM_N];
+    int hpos, hn;
+    /* GPU client processes */
+    GClient *cl;
+    int ncl, clcap, *ord, nord;
+    unsigned gen;
+    pid_t focus;
+    long focus_s, focus_us;
+    int clients_seen;
+    /* events */
+    GEvent ev[GNEV];
+    unsigned long nev;
+    int was_thermal, was_limit, was_pressure, was_mem;
+    int64_t recov;
+} G = { .focus = -1, .sel_pid = -1 };
+
+static void gpu_event(int sev, const char *fmt, ...)
+{
+    GEvent *e = &G.ev[G.nev % GNEV];
+    va_list ap;
+    e->t = time(NULL);
+    e->sev = sev;
+    va_start(ap, fmt);
+    vsnprintf(e->s, sizeof e->s, fmt, ap);
+    va_end(ap);
+    G.nev++;
+}
+
+static void gpu_static_init(void)
+{
+    io_iterator_t it;
+    io_object_t acc;
+    snprintf(G.name, sizeof G.name, "%s", S.gpu_name[0] ? S.gpu_name : "GPU");
+    if (IOServiceGetMatchingServices(MACH_PORT_NULL, IOServiceMatching("IOAccelerator"), &it) != KERN_SUCCESS) return;
+    if ((acc = IOIteratorNext(it))) {
+        CFTypeRef cfg = reg_prop(acc, "GPUConfigurationVariable"), v;
+        G.cores = (int)reg_i64(acc, "gpu-core-count", 0);
+        if (cfg && CFGetTypeID(cfg) == CFDictionaryGetTypeID()) {
+            char var[8];
+            int64_t gen = dict_i64(cfg, "gpu_gen", -1);
+            if (!G.cores) G.cores = (int)dict_i64(cfg, "num_cores", 0);
+            G.mgpus = (int)dict_i64(cfg, "num_mgpus", 0);
+            cfstr_get(CFDictionaryGetValue(cfg, CFSTR("gpu_var")), var, sizeof var);
+            if (gen >= 0) snprintf(G.family, sizeof G.family, "G%lld%s", (long long)gen, var);
+        }
+        if (cfg) CFRelease(cfg);
+        if ((v = reg_prop(acc, "IOSourceVersion"))) { cfstr_get(v, G.driver, sizeof G.driver); CFRelease(v); }
+        if ((v = reg_prop(acc, "MetalPluginName"))) { cfstr_get(v, G.metal, sizeof G.metal); CFRelease(v); }
+        IOObjectRelease(acc);
+    }
+    IOObjectRelease(it);
+}
+
+/* GPU DVFS table: pmgr "voltage-states9", (frequency, voltage) u32 pairs;
+ * entry k is performance state P(k+1) once the 0 Hz entry is dropped. */
+static void gpu_freq_init(void)
+{
+    io_iterator_t it;
+    io_object_t e;
+    if (IOServiceGetMatchingServices(MACH_PORT_NULL, IOServiceNameMatching("pmgr"), &it) != KERN_SUCCESS) return;
+    while ((e = IOIteratorNext(it))) {
+        CFTypeRef v = reg_prop(e, "voltage-states9");
+        if (v && CFGetTypeID(v) == CFDataGetTypeID() && !G.nfreq) {
+            const uint8_t *b = CFDataGetBytePtr(v);
+            CFIndex len = CFDataGetLength(v), i;
+            double mx = 0, div;
+            uint32_t raw[GNS];
+            int n = 0, k;
+            for (i = 0; i + 8 <= len && n < GNS; i += 8) {
+                uint32_t f;
+                memcpy(&f, b + i, sizeof f);
+                if (!f) continue;
+                raw[n++] = f;
+                if (f > mx) mx = f;
+            }
+            div = mx > 1e7 ? 1e6 : mx > 1e4 ? 1e3 : 1; /* Hz or kHz depending on the chip */
+            for (k = 0; k < n; k++) G.freq[k] = raw[k] / div;
+            G.nfreq = n;
+            G.fmax = mx / div;
+        }
+        if (v) CFRelease(v);
+        IOObjectRelease(e);
+    }
+    IOObjectRelease(it);
+}
+
+enum { GC_E_GPU, GC_E_GPUN, GC_E_DRAM, GC_E_ANE, GC_E_CPU, GC_PSTATE, GC_PWRCTRL, GC_CLTM, GC_PMU, GC_PPM, GC_PZONE,
+       GC_THROT, GC_RESTART, GC_UVWARN, GC_BW_RD, GC_BW_WR, GC_LAT };
+
+/* Which of the subscribed IOReport channels this is; -1 for the rest. */
+static int ior_class(CFDictionaryRef ch)
+{
+    char g[64], sg[96], nm[96];
+    cfstr_get(IOReportChannelGetGroup(ch), g, sizeof g);
+    cfstr_get(IOReportChannelGetSubGroup(ch), sg, sizeof sg);
+    cfstr_get(IOReportChannelGetChannelName(ch), nm, sizeof nm);
+    if (!strcmp(g, "Energy Model")) {
+        if (!strcmp(nm, "GPU Energy")) return GC_E_GPU;
+        if (!strncmp(nm, "GPU", 3) && nm[3] >= '0' && nm[3] <= '9') return GC_E_GPUN;
+        if (!strncmp(nm, "DRAM", 4)) return GC_E_DRAM;
+        if (!strncmp(nm, "ANE", 3)) return GC_E_ANE;
+        if (!strcmp(nm, "CPU Energy")) return GC_E_CPU;
+    } else if (!strcmp(g, "GPU Stats")) {
+        if (!strcmp(sg, "GPU Performance States")) return GC_PSTATE;
+        if (!strcmp(sg, "GPU Power Controller States")) return GC_PWRCTRL;
+        if (!strcmp(sg, "CLTM-induced GPU Performance States")) return GC_CLTM;
+        if (!strcmp(sg, "PMU Loop Lost Performance Reason Code States")) return GC_PMU;
+        if (!strcmp(sg, "PPM Target as % of Max GPU Power")) return GC_PPM;
+        if (!strcmp(sg, "GPU Discrete Power Zone Residency")) return GC_PZONE;
+        if (!strcmp(sg, "GPU Throttler Counters") && !strncmp(nm, "Throttle Counter Total", 22)) return GC_THROT;
+        if (!strcmp(sg, "Issue Counts") && !strcmp(nm, "Total Restarts")) return GC_RESTART;
+        if (!strcmp(sg, "UV Warn State") && !strcmp(nm, "UVWarn Instances")) return GC_UVWARN;
+    } else if (!strncmp(g, "PMP", 3)) {
+        if (!strcmp(sg, "DCS BW") && !strcmp(nm, "AMCC RD")) return GC_BW_RD;
+        if (!strcmp(sg, "DCS BW") && !strcmp(nm, "AMCC WR")) return GC_BW_WR;
+        if (!strcmp(sg, "AGX") && !strcmp(nm, "Mem Latency")) return GC_LAT;
+    }
+    return -1;
+}
+
+static CFIndex ior_nchan(CFDictionaryRef d)
+{
+    CFArrayRef a = d ? CFDictionaryGetValue(d, CFSTR("IOReportChannels")) : NULL;
+    return a && CFGetTypeID(a) == CFArrayGetTypeID() ? CFArrayGetCount(a) : 0;
+}
+
+/* Subscribes to the GPU energy, performance-state, limiter and memory
+ * controller channels only; the full channel set is thousands strong. */
+static void ior_init(void)
+{
+    static const char *grp[] = { "Energy Model", "GPU Stats", "PMP", "PMP0" };
+    CFMutableDictionaryRef all = NULL;
+    CFMutableArrayRef keep;
+    CFArrayRef a;
+    CFIndex i, n;
+    size_t k;
+    int pmp = 0;
+    for (k = 0; k < sizeof grp / sizeof grp[0]; k++) {
+        CFStringRef s;
+        CFDictionaryRef d;
+        if (k == 3 && pmp) break; /* "PMP0" only on chips without a "PMP" group */
+        s = CFStringCreateWithCString(NULL, grp[k], kCFStringEncodingUTF8);
+        d = IOReportCopyChannelsInGroup(s, NULL, 0, 0, 0);
+        CFRelease(s);
+        if (!ior_nchan(d)) {
+            if (d) CFRelease(d);
+            continue;
+        }
+        if (k == 2) pmp = 1;
+        if (!all) all = CFDictionaryCreateMutableCopy(NULL, 0, d);
+        else IOReportMergeChannels(all, d, NULL);
+        CFRelease(d);
+    }
+    if (!all) return;
+    a = CFDictionaryGetValue(all, CFSTR("IOReportChannels"));
+    n = a && CFGetTypeID(a) == CFArrayGetTypeID() ? CFArrayGetCount(a) : 0;
+    keep = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    for (i = 0; i < n; i++) {
+        CFDictionaryRef ch = CFArrayGetValueAtIndex(a, i);
+        if (CFGetTypeID(ch) == CFDictionaryGetTypeID() && ior_class(ch) >= 0) CFArrayAppendValue(keep, ch);
+    }
+    n = CFArrayGetCount(keep);
+    CFDictionarySetValue(all, CFSTR("IOReportChannels"), keep);
+    CFRelease(keep);
+    if (!n) return;
+    /* `all` stays alive for the lifetime of the subscription */
+    G.sub = IOReportCreateSubscription(NULL, all, &G.subbed, 0, NULL);
+    if (!G.sub || !G.subbed) return;
+    G.t_ior = now_s();
+    G.prev = IOReportCreateSamples(G.sub, G.subbed, NULL);
+    G.ior = G.prev != NULL;
+}
+
+static void gst_begin(GStates *st)
+{
+    int i;
+    for (i = 0; i < st->n; i++) st->res[i] = 0;
+    st->tot = 0;
+}
+
+/* Adds one state channel's residencies (channels of a class are summed). */
+static void gst_read(GStates *st, CFDictionaryRef ch)
+{
+    int32_t i, n = IOReportStateGetCount(ch);
+    if (n > GNS) n = GNS;
+    if (n < 0) n = 0;
+    if (n != st->n) {
+        memset(st, 0, sizeof *st);
+        st->n = n;
+    }
+    for (i = 0; i < n; i++) {
+        double r = (double)IOReportStateGetResidency(ch, i);
+        if (r < 0) r = 0;
+        cfstr_get(IOReportStateGetNameForIndex(ch, i), st->name[i], sizeof st->name[i]);
+        st->res[i] += r;
+        st->tot += r;
+        st->cum[i] += r;
+        st->cumtot += r;
+    }
+}
+
+/* Fraction of time spent in the state called `name`; -1 if unknown. */
+static double gst_frac(const GStates *st, const char *name, int cum)
+{
+    int i;
+    double t = cum ? st->cumtot : st->tot;
+    if (t <= 0) return -1;
+    for (i = 0; i < st->n; i++)
+        if (!strcmp(st->name[i], name)) return (cum ? st->cum[i] : st->res[i]) / t;
+    return -1;
+}
+
+/* Fraction of time outside the state called `ok` (0 when unknown). */
+static double gst_out(const GStates *st, const char *ok, int cum)
+{
+    double f = gst_frac(st, ok, cum);
+    return f < 0 ? 0 : 1 - f;
+}
+
+/* Performance state number of "P7", 0 for "OFF" and the like. */
+static int gst_pnum(const char *name)
+{
+    return name[0] == 'P' && name[1] >= '0' && name[1] <= '9' ? atoi(name + 1) : 0;
+}
+
+/* Power controller states that hold the clock below what the load asks
+ * for (power, thermal and platform limits). */
+static int pc_limiting(const char *n)
+{
+    static const char *L[] = { "POWER", "PWR_ZONE", "FAST_DIE", "PRFLIMIT", "PPMLIMIT", "CLTMLIMI", "PPMTARGE", "PMULOOP" };
+    size_t i;
+    for (i = 0; i < sizeof L / sizeof L[0]; i++)
+        if (!strcmp(n, L[i])) return 1;
+    return 0;
+}
+
+/* Share of active (non-idle) GPU time under limiting controllers; their
+ * names go to `o`. */
+static double gpu_limit(char *o, size_t sz, int cum)
+{
+    const GStates *st = &G.pc;
+    double act = 0, lim = 0;
+    int i;
+    size_t used = 0;
+    if (o && sz) o[0] = 0;
+    for (i = 0; i < st->n; i++) {
+        double r = cum ? st->cum[i] : st->res[i];
+        if (!strcmp(st->name[i], "IDLE_OFF")) continue;
+        act += r;
+        if (!pc_limiting(st->name[i]) || r <= 0) continue;
+        lim += r;
+        if (o && used + 12 < sz) used += (size_t)snprintf(o + used, sz - used, "%s%s", used ? ", " : "", st->name[i]);
+    }
+    return act > 0 ? lim / act : 0;
+}
+
+/* Mean of a bucketed state channel ("16GB/s", "64Cyc", ...): each state
+ * counts the windows that fell in its bucket, labelled by the upper edge,
+ * so the bucket midpoint stands for them. -1 when empty. */
+static double ior_hist_mean(CFDictionaryRef ch)
+{
+    int32_t i, n = IOReportStateGetCount(ch);
+    double edge[128], cnt = 0, sum = 0, step;
+    char nm[32];
+    if (n > 128) n = 128;
+    if (n < 2) return -1;
+    for (i = 0; i < n; i++) {
+        cfstr_get(IOReportStateGetNameForIndex(ch, i), nm, sizeof nm);
+        edge[i] = strtod(nm, NULL);
+    }
+    step = edge[1] - edge[0];
+    for (i = 0; i < n; i++) {
+        double c = (double)IOReportStateGetResidency(ch, i);
+        if (c <= 0) continue;
+        sum += (edge[i] - step / 2) * c;
+        cnt += c;
+    }
+    return cnt > 0 ? sum / cnt : -1;
+}
+
+/* Time-weighted power target from "0-9%" .. "100%" buckets. */
+static double ior_ppm(CFDictionaryRef ch)
+{
+    int32_t i, n = IOReportStateGetCount(ch);
+    double sum = 0, tot = 0;
+    char nm[32];
+    for (i = 0; i < n; i++) {
+        double r = (double)IOReportStateGetResidency(ch, i), lo;
+        if (r <= 0) continue;
+        cfstr_get(IOReportStateGetNameForIndex(ch, i), nm, sizeof nm);
+        lo = strtod(nm, NULL);
+        sum += (lo >= 100 ? 100 : lo + 5) * r;
+        tot += r;
+    }
+    return tot > 0 ? sum / tot : -1;
+}
+
+static double ior_joules(CFDictionaryRef ch)
+{
+    char u[16];
+    double v = (double)IOReportSimpleGetIntegerValue(ch, 0);
+    cfstr_get(IOReportChannelGetUnitLabel(ch), u, sizeof u);
+    if (!strcmp(u, "nJ")) return v * 1e-9;
+    if (!strcmp(u, "uJ") || !strcmp(u, "\xc2\xb5J")) return v * 1e-6;
+    if (!strcmp(u, "J")) return v;
+    return v * 1e-3; /* mJ */
+}
+
+static void ior_sample(double now)
+{
+    CFDictionaryRef cur, d;
+    CFArrayRef a;
+    CFIndex i, n;
+    double dt, eg = 0, egn = 0, ed = 0, ea = 0, ec = 0, bwr = 0, bww = 0, lat = 0, ppm = -1, v;
+    int seen_eg = 0, seen_egn = 0, nbw = 0, nlat = 0, j;
+    if (!G.ior) return;
+    cur = IOReportCreateSamples(G.sub, G.subbed, NULL);
+    if (!cur) return;
+    d = IOReportCreateSamplesDelta(G.prev, cur, NULL);
+    CFRelease(G.prev);
+    G.prev = cur;
+    dt = now - G.t_ior;
+    G.t_ior = now;
+    if (!d) return;
+    gst_begin(&G.ps);
+    gst_begin(&G.pc);
+    gst_begin(&G.cltm);
+    gst_begin(&G.pmu);
+    gst_begin(&G.pz);
+    G.throttle = G.restarts = G.uvwarn = 0;
+    a = CFDictionaryGetValue(d, CFSTR("IOReportChannels"));
+    n = a && CFGetTypeID(a) == CFArrayGetTypeID() ? CFArrayGetCount(a) : 0;
+    for (i = 0; i < n; i++) {
+        CFDictionaryRef ch = CFArrayGetValueAtIndex(a, i);
+        int state = IOReportChannelGetFormat(ch) == 2;
+        switch (ior_class(ch)) {
+        case GC_E_GPU: eg += ior_joules(ch); seen_eg = 1; break;
+        case GC_E_GPUN: egn += ior_joules(ch); seen_egn = 1; break;
+        case GC_E_DRAM: ed += ior_joules(ch); break;
+        case GC_E_ANE: ea += ior_joules(ch); break;
+        case GC_E_CPU: ec += ior_joules(ch); break;
+        case GC_PSTATE: if (state) gst_read(&G.ps, ch); break;
+        case GC_PWRCTRL: if (state) gst_read(&G.pc, ch); break;
+        case GC_CLTM: if (state) gst_read(&G.cltm, ch); break;
+        case GC_PMU: if (state) gst_read(&G.pmu, ch); break;
+        case GC_PZONE: if (state) gst_read(&G.pz, ch); break;
+        case GC_PPM: if (state && (v = ior_ppm(ch)) >= 0) ppm = v; break;
+        case GC_THROT: G.throttle += (long)IOReportSimpleGetIntegerValue(ch, 0); break;
+        case GC_RESTART: G.restarts += (long)IOReportSimpleGetIntegerValue(ch, 0); break;
+        case GC_UVWARN: G.uvwarn += (long)IOReportSimpleGetIntegerValue(ch, 0); break;
+        case GC_BW_RD: if (state && (v = ior_hist_mean(ch)) >= 0) { bwr += v; nbw++; } break;
+        case GC_BW_WR: if (state && (v = ior_hist_mean(ch)) >= 0) { bww += v; nbw++; } break;
+        case GC_LAT: if (state && (v = ior_hist_mean(ch)) >= 0) { lat += v; nlat++; } break;
+        }
+    }
+    CFRelease(d);
+    if (dt <= 0.01) return;
+    if (!seen_eg) eg = egn;
+    G.has_gpu_w = seen_eg || seen_egn;
+    G.gpu_w = eg / dt;
+    /* these channels exist on chips that leave them at zero: show only once seen */
+    G.has_dram_w |= ed > 0;
+    G.has_ane_w |= ea > 0;
+    G.has_cpu_w |= ec > 0;
+    G.dram_w = ed / dt;
+    G.ane_w = ea / dt;
+    G.cpu_w = ec / dt;
+    if (G.primed) {
+        G.energy_j += eg;
+        G.dram_j += ed;
+        G.throttle_tot += G.throttle;
+        G.restarts_tot += G.restarts;
+        G.uvwarn_tot += G.uvwarn;
+    }
+    G.has_bw = nbw > 0;
+    G.bw_rd = bwr;
+    G.bw_wr = bww;
+    G.has_lat = nlat > 0;
+    G.lat = nlat ? lat / nlat : 0;
+    G.has_ppm = ppm >= 0;
+    G.ppm = ppm;
+    {
+        double act = 0, fsum = 0, fres = 0;
+        for (j = 0; j < G.ps.n; j++) {
+            int k = gst_pnum(G.ps.name[j]);
+            if (k <= 0) continue;
+            act += G.ps.res[j];
+            if (k <= G.nfreq) {
+                fsum += G.freq[k - 1] * G.ps.res[j];
+                fres += G.ps.res[j];
+            }
+        }
+        G.has_freq = G.ps.tot > 0;
+        G.active_res = G.ps.tot > 0 ? act / G.ps.tot * 100 : 0;
+        G.mhz = fres > 0 ? fsum / fres : 0;
+    }
+}
+
+/* AppleSMC user client: GPU die temperatures are the "Tg.." float keys. */
+typedef struct { uint8_t major, minor, build, reserved; uint16_t release; } SmcVers;
+typedef struct { uint16_t version, length; uint32_t cpu, gpu, mem; } SmcPLimit;
+typedef struct { uint32_t size, type; uint8_t attr; } SmcKeyInfo;
+typedef struct {
+    uint32_t key;
+    SmcVers vers;
+    SmcPLimit plimit;
+    SmcKeyInfo info;
+    uint8_t result, status, data8;
+    uint32_t data32;
+    uint8_t bytes[32];
+} SmcParam;
+enum { SMC_READ = 5, SMC_INDEX = 8, SMC_INFO = 9 };
+#define KEY4(s) ((uint32_t)(s)[0] << 24 | (uint32_t)(s)[1] << 16 | (uint32_t)(s)[2] << 8 | (uint32_t)(s)[3])
+
+static int smc_call(SmcParam *in, SmcParam *out)
+{
+    size_t osz = sizeof *out;
+    memset(out, 0, sizeof *out);
+    return IOConnectCallStructMethod(G.smc, 2, in, sizeof *in, out, &osz) == KERN_SUCCESS && !out->result;
+}
+
+/* Reads `key`; ki->size == 0 looks the key's size and type up first. */
+static int smc_read(uint32_t key, SmcKeyInfo *ki, SmcParam *out)
+{
+    SmcParam in;
+    memset(&in, 0, sizeof in);
+    in.key = key;
+    if (!ki->size) {
+        in.data8 = SMC_INFO;
+        if (!smc_call(&in, out)) return 0;
+        *ki = out->info;
+    }
+    in.info.size = ki->size;
+    in.data8 = SMC_READ;
+    return smc_call(&in, out);
+}
+
+static void smc_init(void)
+{
+    io_service_t s = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("AppleSMC"));
+    SmcParam in, out;
+    SmcKeyInfo ki = { 0, 0, 0 };
+    uint32_t i, n;
+    if (!s) return;
+    if (IOServiceOpen(s, mach_task_self(), 0, &G.smc) != KERN_SUCCESS) G.smc = 0;
+    IOObjectRelease(s);
+    if (!G.smc || !smc_read(KEY4("#KEY"), &ki, &out)) return;
+    n = (uint32_t)out.bytes[0] << 24 | (uint32_t)out.bytes[1] << 16 | (uint32_t)out.bytes[2] << 8 | out.bytes[3];
+    for (i = 0; i < n && G.ntk < (int)(sizeof G.tkey / sizeof G.tkey[0]); i++) {
+        SmcKeyInfo k2 = { 0, 0, 0 };
+        uint32_t key;
+        memset(&in, 0, sizeof in);
+        in.data8 = SMC_INDEX;
+        in.data32 = i;
+        if (!smc_call(&in, &out)) continue;
+        key = out.key;
+        if ((key >> 24) != 'T' || ((key >> 16) & 0xff) != 'g') continue;
+        if (smc_read(key, &k2, &out) && k2.type == KEY4("flt ") && k2.size == 4) G.tkey[G.ntk++] = key;
+    }
+}
+
+static void smc_sample(void)
+{
+    SmcKeyInfo ki = { 4, KEY4("flt "), 0 };
+    SmcParam out;
+    double sum = 0, mx = 0;
+    int i, n = 0;
+    for (i = 0; i < G.ntk; i++) {
+        float f;
+        if (!smc_read(G.tkey[i], &ki, &out)) continue;
+        memcpy(&f, out.bytes, sizeof f);
+        if (!(f > 1 && f < 150)) continue; /* unpopulated sensors read 0 or garbage */
+        sum += f;
+        if (f > mx) mx = f;
+        n++;
+    }
+    G.has_temp = n > 0;
+    G.ntemp = n;
+    G.temp = n ? sum / n : 0;
+    G.tmax = mx;
+    if (G.primed && mx > G.tmax_peak) G.tmax_peak = mx;
+}
+
+/* GPU-tagged memory of a process (Metal heaps, textures, buffers): its
+ * graphics ledger, resident plus compressed. Same-user processes or root. */
+static int64_t task_gfx(pid_t pid)
+{
+    mach_port_t t;
+    task_vm_info_data_t vi;
+    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    kern_return_t kr;
+    if (task_name_for_pid(mach_task_self(), pid, &t) != KERN_SUCCESS) return -1;
+    kr = task_info(t, TASK_VM_INFO, (task_info_t)&vi, &n);
+    mach_port_deallocate(mach_task_self(), t);
+    if (kr != KERN_SUCCESS || n < TASK_VM_INFO_REV3_COUNT) return -1;
+    return vi.ledger_tag_graphics_footprint + vi.ledger_tag_graphics_footprint_compressed;
+}
+
+static GClient *gcl_get(pid_t pid, long ss, long su)
+{
+    GClient *c;
+    int i, old = -1;
+    for (i = 0; i < G.ncl; i++) {
+        c = &G.cl[i];
+        if (c->pid == pid && c->start_s == ss && c->start_us == su) {
+            if (!c->alive) { c->alive = 1; c->fresh = 1; }
+            return c;
+        }
+    }
+    if (G.ncl == G.clcap) {
+        if (G.clcap >= GMAXCL) {
+            for (i = 0; i < G.ncl; i++)
+                if (!G.cl[i].alive && (old < 0 || G.cl[i].gone_t < G.cl[old].gone_t)) old = i;
+            if (old < 0) return NULL;
+            G.cl[old] = G.cl[--G.ncl];
+        } else {
+            G.clcap = G.clcap ? G.clcap * 2 : 64;
+            G.cl = xrealloc(G.cl, (size_t)G.clcap * sizeof *G.cl);
+            G.ord = xrealloc(G.ord, (size_t)G.clcap * sizeof *G.ord);
+        }
+    }
+    c = &G.cl[G.ncl++];
+    memset(c, 0, sizeof *c);
+    c->pid = pid;
+    c->start_s = ss;
+    c->start_us = su;
+    c->alive = c->fresh = 1;
+    c->gfx = c->gfx_peak = -1;
+    return c;
+}
+
+static double gcl_avg(const GClient *c)
+{
+    double t = (c->alive ? G.t_last : c->gone_t) - c->first_t;
+    return t > 0.5 ? (double)(c->ns - c->ns0) / (t * 1e9) * 100.0 : c->cur;
+}
+
+static int gcl_cmp(const void *a, const void *b)
+{
+    const GClient *x = &G.cl[*(const int *)a], *y = &G.cl[*(const int *)b];
+    double vx, vy;
+    if (x->alive != y->alive) return y->alive - x->alive;
+    switch (G.sort) {
+    case GS_AVG: vx = gcl_avg(x); vy = gcl_avg(y); break;
+    case GS_TIME: vx = (double)(x->ns - x->ns0); vy = (double)(y->ns - y->ns0); break;
+    case GS_GFX: vx = (double)x->gfx; vy = (double)y->gfx; break;
+    case GS_PID: return x->pid < y->pid ? -1 : x->pid > y->pid;
+    default: vx = x->cur; vy = y->cur;
+    }
+    if (vx != vy) return vx < vy ? 1 : -1;
+    if (x->ns != y->ns) return x->ns < y->ns ? 1 : -1;
+    return x->pid < y->pid ? -1 : x->pid > y->pid;
+}
+
+/* Rebuilds the display order; the selection follows its process. */
+static void gpu_order(void)
+{
+    int i;
+    G.nord = G.ncl;
+    for (i = 0; i < G.ncl; i++) G.ord[i] = i;
+    if (G.nord > 1) qsort(G.ord, (size_t)G.nord, sizeof *G.ord, gcl_cmp);
+    for (i = 0; i < G.nord; i++)
+        if (G.cl[G.ord[i]].pid == G.sel_pid) { G.sel = i; break; }
+    if (G.sel >= G.nord) G.sel = G.nord ? G.nord - 1 : 0;
+}
+
+/* Folds this sample's accelerator clients into per-process records. */
+static void gpu_clients(double now)
+{
+    double tot = 0;
+    size_t k;
+    int i;
+    G.gen++;
+    for (k = 0; k < S.ngu; k++) {
+        const GpuUse *u = &S.gu[k];
+        Proc *p = u->pid >= 0 && u->pid < PID_CAP ? bypid[u->pid] : NULL;
+        GClient *c = gcl_get(u->pid, p ? p->start_s : 0, p ? p->start_us : 0);
+        if (!c) continue;
+        if (c->gen != G.gen) {
+            c->gen = G.gen;
+            c->ns = c->last_sub = 0;
+            c->queues = c->qmax = c->nclients = 0;
+            c->api = 0;
+        }
+        if (p) snprintf(c->name, sizeof c->name, "%s", p->name);
+        else if (!c->name[0]) snprintf(c->name, sizeof c->name, "pid %d", u->pid);
+        c->ns += u->ns;
+        if (u->last > c->last_sub) c->last_sub = u->last;
+        c->queues += u->queues;
+        c->qmax += u->qmax;
+        c->nclients++;
+        c->api |= u->api;
+    }
+    for (i = 0; i < G.ncl; i++) {
+        GClient *c = &G.cl[i];
+        Proc *p = c->pid >= 0 && c->pid < PID_CAP ? bypid[c->pid] : NULL;
+        int same = p && p->start_s == c->start_s && p->start_us == c->start_us;
+        if (c->gen != G.gen) {
+            if (c->alive) {
+                c->alive = 0;
+                c->gone_t = now;
+                c->cur = c->est_w = 0;
+                if (G.clients_seen)
+                    gpu_event(same ? 0 : 1, "%s (%d) %s", c->name, c->pid, same ? "closed its GPU connections" : "exited");
+            }
+            continue;
+        }
+        if (c->fresh) {
+            c->fresh = 0;
+            c->ns0 = c->ns_prev = c->ns;
+            c->t_prev = c->first_t = now;
+            c->cur = 0;
+            if (G.clients_seen) gpu_event(0, "%s (%d) started GPU work", c->name, c->pid);
+        } else if (c->ns < c->ns_prev) { /* a GPU connection closed and took its time with it */
+            uint64_t drop = c->ns_prev - c->ns;
+            c->ns0 = c->ns0 > drop ? c->ns0 - drop : 0;
+            c->ns_prev = c->ns;
+            c->t_prev = now;
+            c->cur = 0;
+        } else if (now - c->t_prev > 0.05) {
+            c->cur = (double)(c->ns - c->ns_prev) / ((now - c->t_prev) * 1e9) * 100.0;
+            c->ns_prev = c->ns;
+            c->t_prev = now;
+        }
+        if (c->cur > c->peak) c->peak = c->cur;
+        c->hist[c->hn % GPH] = (float)c->cur;
+        c->hn++;
+        c->phys = p && (p->has_task || p->has_ru) ? p->mem : 0;
+        c->gfx = task_gfx(c->pid);
+        if (c->gfx > c->gfx_peak) c->gfx_peak = c->gfx;
+        tot += c->cur;
+    }
+    for (i = 0; i < G.ncl; i++) {
+        GClient *c = &G.cl[i];
+        c->est_w = c->alive && G.has_gpu_w && tot > 0 ? G.gpu_w * c->cur / tot : 0;
+    }
+    G.clients_seen = 1;
+    gpu_order();
+}
+
+static int fcmp(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void gm_push(int id, double v, int ok)
+{
+    GMet *m = &G.m[id];
+    float tmp[GHIST];
+    int w, i;
+    m->h[G.hpos] = ok ? (float)v : 0;
+    if (!ok) return;
+    m->ok = 1;
+    m->cur = v;
+    m->sum += v;
+    if (!m->n || v < m->mn) m->mn = v;
+    if (!m->n || v > m->mx) m->mx = v;
+    m->n++;
+    w = m->n < GHIST ? (int)m->n : GHIST;
+    for (i = 0; i < w; i++) tmp[i] = m->h[(G.hpos - i + GHIST) % GHIST];
+    qsort(tmp, (size_t)w, sizeof *tmp, fcmp);
+    m->p95 = tmp[(int)ceil(0.95 * w) - 1]; /* nearest rank */
+}
+
+static double gm_avg(int id) { return G.m[id].n ? G.m[id].sum / (double)G.m[id].n : 0; }
+
+static uint64_t gpu_mem_limit(void)
+{
+    return G.wired_mb > 0 ? (uint64_t)G.wired_mb << 20 : 0;
+}
+
+static const char *pressure_name(int p) { return p >= 4 ? "critical" : p >= 2 ? "warning" : "normal"; }
+
+/* State transitions worth a line in the event log. */
+static void gpu_events(int emit)
+{
+    char lim[96];
+    double th = gst_out(&G.cltm, "NO_CLTM", 0), lf = gpu_limit(lim, sizeof lim, 0);
+    uint64_t ml = gpu_mem_limit();
+    int thermal = th > 0.001, limit = lf > 0.001, mem = ml && S.gpu_mem >= ml / 10 * 9;
+    if (emit) {
+        if (thermal != G.was_thermal)
+            gpu_event(thermal, thermal ? "Thermal limiting (CLTM) engaged for %.0f%% of the sample" : "Thermal limiting cleared",
+                      th * 100);
+        if (limit != G.was_limit)
+            gpu_event(limit, limit ? "GPU clock held by %s for %.0f%% of active time" : "GPU clock limits cleared", lim, lf * 100);
+        if (G.throttle > 0) gpu_event(1, "GPU throttle counter +%ld", G.throttle);
+        if (G.restarts > 0) gpu_event(2, "GPU restarted %ld time%s", G.restarts, G.restarts == 1 ? "" : "s");
+        if (S.gpu_recov > G.recov) gpu_event(2, "GPU recovery: driver recoveryCount now %lld", (long long)S.gpu_recov);
+        if (G.uvwarn > 0) gpu_event(1, "GPU undervoltage warning \xc3\x97%ld", G.uvwarn);
+        if (S.pressure != G.was_pressure)
+            gpu_event(S.pressure >= 4 ? 2 : S.pressure >= 2, "Memory pressure %s", pressure_name(S.pressure));
+        if (mem != G.was_mem) {
+            char a[16], b[16];
+            fmt_mem(S.gpu_mem, a, sizeof a);
+            fmt_mem(ml, b, sizeof b);
+            gpu_event(mem, mem ? "GPU memory in use %s reached 90%% of the %s wired limit" : "GPU memory in use back to %s of %s",
+                      a, b);
+        }
+    }
+    G.was_thermal = thermal;
+    G.was_limit = limit;
+    G.was_pressure = S.pressure;
+    if (mem || !ml || S.gpu_mem < ml / 100 * 85) G.was_mem = mem; /* hysteresis */
+    G.recov = S.gpu_recov;
+}
+
+/* Runs after every sample_all once GPU telemetry is active. The first call
+ * is a baseline: rates and events start with the second. */
+static void gpu_sample(double now)
+{
+    int primed = G.primed;
+    G.wired_mb = sysctl_long("iogpu.wired_limit_mb");
+    ior_sample(now);
+    smc_sample();
+    gpu_clients(S.sample_t);
+    gpu_events(primed);
+    G.primed = 1;
+    G.t_last = now;
+    if (!primed) return;
+    G.hpos = (G.hpos + 1) % GHIST;
+    if (G.hn < GHIST) G.hn++;
+    gm_push(GM_UTIL, S.gpu_util * 100, S.has_gpu);
+    gm_push(GM_REND, S.gpu_rend, S.gpu_rend >= 0);
+    gm_push(GM_TILER, S.gpu_tiler, S.gpu_tiler >= 0);
+    gm_push(GM_ACTIVE, G.active_res, G.has_freq);
+    gm_push(GM_FREQ, G.mhz, G.has_freq && G.nfreq);
+    gm_push(GM_POWER, G.gpu_w, G.has_gpu_w);
+    gm_push(GM_TEMP, G.temp, G.has_temp);
+    gm_push(GM_TMAX, G.tmax, G.has_temp);
+    gm_push(GM_MEM, (double)S.gpu_mem, S.has_gpu);
+    gm_push(GM_BW, G.bw_rd + G.bw_wr, G.has_bw);
+    gm_push(GM_DRAMW, G.dram_w, G.has_dram_w);
+    G.samples++;
+}
+
+/* Statistics restart from now; history graphs keep their past. */
+static void gpu_reset(void)
+{
+    GStates *st[] = { &G.ps, &G.pc, &G.cltm, &G.pmu, &G.pz };
+    size_t k;
+    int i, j;
+    for (i = 0; i < GM_N; i++) {
+        GMet *m = &G.m[i];
+        m->sum = m->mn = m->mx = m->p95 = 0;
+        m->n = 0;
+    }
+    for (k = 0; k < sizeof st / sizeof st[0]; k++) {
+        for (j = 0; j < st[k]->n; j++) st[k]->cum[j] = 0;
+        st[k]->cumtot = 0;
+    }
+    G.energy_j = G.dram_j = G.tmax_peak = 0;
+    G.throttle_tot = G.restarts_tot = G.uvwarn_tot = G.samples = 0;
+    for (i = 0; i < G.ncl;) {
+        GClient *c = &G.cl[i];
+        if (!c->alive) {
+            G.cl[i] = G.cl[--G.ncl];
+            continue;
+        }
+        c->ns0 = c->ns;
+        c->first_t = G.t_last;
+        c->peak = c->cur;
+        c->gfx_peak = c->gfx;
+        i++;
+    }
+    G.t_reset = G.t_last;
+    gpu_event(0, "Statistics reset");
+    gpu_order();
+}
+
+/* Starts GPU telemetry; it then keeps sampling for the rest of the run so
+ * session statistics survive closing the view. */
+static void gpu_activate(void)
+{
+    if (G.active) return;
+    G.active = 1;
+    gpu_static_init();
+    gpu_freq_init();
+    ior_init();
+    smc_init();
+    G.recov = S.gpu_recov;
+    G.t_reset = G.t_last = now_s();
+    gpu_sample(G.t_last);
+}
+
+static int gcl_match(const GClient *c, const char *q)
+{
+    char *end;
+    long v;
+    if (!q || !q[0]) return 1;
+    v = strtol(q, &end, 10);
+    if (!*end) return c->pid == (pid_t)v;
+    return strcasestr(c->name, q) != NULL;
+}
+
+/* The pinned focus process, else the busiest one matching -p, else the
+ * busiest one. */
+static GClient *gpu_focus(void)
+{
+    GClient *best = NULL, *bq = NULL;
+    int i;
+    for (i = 0; i < G.ncl; i++) {
+        GClient *c = &G.cl[i];
+        if (G.focus >= 0 && c->pid == G.focus && c->start_s == G.focus_s && c->start_us == G.focus_us) return c;
+        if (!c->alive) continue;
+        if (!best || c->cur > best->cur || (c->cur == best->cur && c->ns > best->ns)) best = c;
+        if (G.query && gcl_match(c, G.query) && (!bq || c->cur > bq->cur || (c->cur == bq->cur && c->ns > bq->ns))) bq = c;
+    }
+    return bq ? bq : best;
+}
+
+/* "12 ms", "3.4 s", "5m 02s" since a lastSubmittedTime */
+static void fmt_ago(uint64_t last, char *o, size_t sz)
+{
+    uint64_t now = tk2ns(mach_absolute_time());
+    double s = now > last ? (double)(now - last) / 1e9 : 0;
+    if (!last) snprintf(o, sz, "-");
+    else if (s < 1) snprintf(o, sz, "%.0f ms", s * 1000);
+    else if (s < 60) snprintf(o, sz, "%.1f s", s);
+    else fmt_dur(s, o, sz);
+}
+
+static void api_str(unsigned a, char *o, size_t sz)
+{
+    snprintf(o, sz, "%s%s%s%s", a & API_METAL ? "Metal+" : "", a & API_GL ? "GL+" : "", a & API_CL ? "CL+" : "",
+             a & API_OTHER ? "other+" : "");
+    if (o[0]) o[strlen(o) - 1] = 0;
+    else snprintf(o, sz, "-");
+}
+
+static void gm_fmt(int id, double v, char *o, size_t sz)
+{
+    switch (id) {
+    case GM_FREQ: snprintf(o, sz, "%.0f MHz", v); break;
+    case GM_POWER: case GM_DRAMW: fmt_power(v, o, sz); break;
+    case GM_TEMP: case GM_TMAX: snprintf(o, sz, "%.1f\xc2\xb0" "C", v); break;
+    case GM_MEM: fmt_mem((uint64_t)(v < 0 ? 0 : v), o, sz); break;
+    case GM_BW: snprintf(o, sz, "%.1f GB/s", v); break;
+    default: snprintf(o, sz, "%.0f%%", v);
+    }
+}
+
+/* "avg 45% · p95 80% · max 98%" since reset */
+static void gm_stats(int id, char *o, size_t sz)
+{
+    char a[24], b[24], c[24];
+    if (!G.m[id].n) { snprintf(o, sz, "no samples yet"); return; }
+    gm_fmt(id, gm_avg(id), a, sizeof a);
+    gm_fmt(id, G.m[id].p95, b, sizeof b);
+    gm_fmt(id, G.m[id].mx, c, sizeof c);
+    snprintf(o, sz, "avg %s \xc2\xb7 p95 %s \xc2\xb7 max %s", a, b, c);
+}
+
 static void hist_push(float *h, float v) { h[S.hpos] = v; }
 
 /* Takes one full sample. `progress` (may be NULL) is called while walking
@@ -1308,6 +2278,7 @@ static void sample_all(double now, void (*progress)(size_t done, size_t total))
     S.sample_t = now;
     PT.t_last = now;
     PT.first_done = 1;
+    if (G.active) gpu_sample(now);
 }
 
 /* Drops exited processes whose fade-out finished. Returns 1 if any. */
@@ -1684,24 +2655,30 @@ static void meter(int y, int x, int w, const char *label, int lw, const Seg *sg,
     scr_rput(y, x + lw + 1 + bw + 1, vw, ST(vcol, CDEF, 0), val);
 }
 
-/* Ring-buffer sparkline, newest sample on the right; h rows tall. */
-static void spark(int y, int x, int w, int h, const float *ring, double vmax)
+/* Row r of an h-row sparkline over a ring of `cap` samples whose newest is
+ * at `pos` and which holds `n` samples; newest on the right. */
+static void spark_row(int y, int x, int w, int h, int r, const float *ring, int pos, int n, int cap, double vmax, int bg)
 {
-    int i, r;
+    int i;
     for (i = 0; i < w; i++) {
         int age = w - 1 - i;
-        double v = 0, lv;
-        if (age < S.hn) v = ring[(S.hpos - age + HIST) % HIST];
-        v = vmax > 0 ? clampd(v / vmax, 0, 1) : 0;
-        for (r = 0; r < h; r++) {
-            if (age >= S.hn) {
-                set_cell(y + r, x + i, ST(P_GUIDE, CDEF, 0), r == h - 1 ? "\xc2\xb7" : " ", r == h - 1 ? 2 : 1, 1);
-                continue;
-            }
-            lv = clampd(v * h * 8 - (double)(h - 1 - r) * 8, 0, 8);
-            set_cell(y + r, x + i, ST(P_BAR, CDEF, 0), LEVEL[(int)(lv + 0.5)], (int)(lv + 0.5) ? 3 : 1, 1);
+        double v, lv;
+        if (age >= n) {
+            set_cell(y, x + i, ST(P_GUIDE, bg, 0), r == h - 1 ? "\xc2\xb7" : " ", r == h - 1 ? 2 : 1, 1);
+            continue;
         }
+        v = ring[(pos - age + cap) % cap];
+        v = vmax > 0 ? clampd(v / vmax, 0, 1) : 0;
+        lv = clampd(v * h * 8 - (double)(h - 1 - r) * 8, 0, 8);
+        set_cell(y, x + i, ST(P_BAR, bg, 0), LEVEL[(int)(lv + 0.5)], (int)(lv + 0.5) ? 3 : 1, 1);
     }
+}
+
+/* Sparkline of a system history ring (S.hpos / S.hn); h rows tall. */
+static void spark(int y, int x, int w, int h, const float *ring, double vmax)
+{
+    int r;
+    for (r = 0; r < h; r++) spark_row(y + r, x, w, h, r, ring, S.hpos, S.hn, HIST, vmax, CDEF);
 }
 
 static double ease_out(double t)
@@ -2156,7 +3133,7 @@ static const struct { const char *k, *label; int key; } FOOT[] = {
     { "1", "Help", K_F(1) },   { "2", "Inspect", K_F(2) }, { "3", "Search", K_F(3) },
     { "4", "Filter", K_F(4) }, { "5", "Tree", K_F(5) },    { "6", "SortBy", K_F(6) },
     { "7", "Nice-", K_F(7) },  { "8", "Nice+", K_F(8) },   { "9", "Kill", K_F(9) },
-    { "0", "Quit", K_F(10) }
+    { "0", "Quit", K_F(10) },  { "g", "GPU", 'g' }
 };
 #define NFOOT ((int)(sizeof FOOT / sizeof FOOT[0]))
 static int g_foot_x[NFOOT + 1];
@@ -2199,6 +3176,7 @@ static void draw_status(int y, double now)
 }
 
 static void draw_inspect(double now);
+static void draw_gpu(double now);
 
 static void draw_main(double now)
 {
@@ -2245,6 +3223,7 @@ static void draw_main(double now)
     draw_status(SC.h - 2, now);
     draw_footer(SC.h - 1);
     draw_inspect(now);
+    draw_gpu(now);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3036,6 +4015,724 @@ static void draw_inspect(double now)
 }
 
 /* ------------------------------------------------------------------ */
+/* GPU view                                                            */
+/* ------------------------------------------------------------------ */
+
+#define GKW 18 /* key column width */
+
+/* Rows laid out top to bottom in a scrolled area. */
+typedef struct { int x, y, w, h, row, scroll; } GCtx;
+
+/* Screen line of logical row `row + off`, -1 when scrolled out. */
+static int gc_y(const GCtx *c, int off)
+{
+    int r = c->row + off - c->scroll;
+    return r >= 0 && r < c->h ? c->y + r : -1;
+}
+
+static void gc_head(GCtx *c, const char *t)
+{
+    int y, u, i;
+    if (c->row) c->row++;
+    if ((y = gc_y(c, 0)) >= 0) {
+        u = scr_put(y, c->x, c->w, ST(P_ACCENT, P_BOX, A_BOLD), t);
+        for (i = u + 1; i < c->w; i++) set_cell(y, c->x + i, ST(P_GUIDE, P_BOX, 0), "\xe2\x94\x80", 3, 1);
+    }
+    c->row++;
+}
+
+static void gc_kv(GCtx *c, int col, const char *k, const char *fmt, ...)
+{
+    int y = gc_y(c, 0);
+    if (y >= 0) {
+        char v[512];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(v, sizeof v, fmt, ap);
+        va_end(ap);
+        scr_put(y, c->x, GKW - 1, ST(P_DIM, P_BOX, 0), k);
+        scr_put(y, c->x + GKW, c->w - GKW, ST(col ? col : P_TEXT, P_BOX, 0), v);
+    }
+    c->row++;
+}
+
+/* label, bar (f < 0: empty), right-aligned value, faint stats */
+static void gc_meter(GCtx *c, const char *k, double f, int bcol, const char *val, int vcol, const char *stats)
+{
+    int y = gc_y(c, 0), vw = 22, sw = stats && c->w >= 104 ? 42 : 0, bw = c->w - GKW - 1 - vw - (sw ? sw + 1 : 0);
+    if (y < 0) { c->row++; return; }
+    if (bw < 4) bw = 0;
+    scr_put(y, c->x, GKW - 1, ST(P_SOFT, P_BOX, A_BOLD), k);
+    if (bw) {
+        Seg sg;
+        sg.v = clampd(f, 0, 1);
+        sg.col = bcol;
+        seg_bar(y, c->x + GKW, bw, &sg, f >= 0, P_BOX);
+    }
+    scr_rput(y, c->x + GKW + bw + 1, vw, ST(vcol, P_BOX, A_BOLD), val);
+    if (sw) scr_put(y, c->x + GKW + bw + 1 + vw + 2, sw - 1, ST(P_FAINT, P_BOX, 0), stats);
+    c->row++;
+}
+
+/* A metric's meter with its session stats; util-like metrics colour by load. */
+static void gc_metric(GCtx *c, int id, double f, const char *val, int load)
+{
+    char st[128];
+    if (!G.m[id].ok) {
+        gc_meter(c, GMDEF[id].name, -1, P_BAR, "n/a", P_FAINT, NULL);
+        return;
+    }
+    gm_stats(id, st, sizeof st);
+    gc_meter(c, GMDEF[id].name, f, load ? grad_col(f) : P_BAR, val, load ? cpu_val_col(f * 100) : P_TEXT, st);
+}
+
+static double gm_ringmax(int id, double floor)
+{
+    double mx = floor;
+    int i;
+    for (i = 0; i < G.hn; i++) {
+        float v = G.m[id].h[(G.hpos - i + GHIST) % GHIST];
+        if (v > mx) mx = v;
+    }
+    return mx;
+}
+
+/* Three rows: name, value and stats, then a 2-row history graph. */
+static void gc_spark_at(GCtx *c, int xo, int w, int id, double vmax)
+{
+    const GMet *m = &G.m[id];
+    char cur[32], st[128];
+    int y, r, u;
+    if ((y = gc_y(c, 0)) >= 0) {
+        if (m->ok) gm_fmt(id, m->cur, cur, sizeof cur);
+        else snprintf(cur, sizeof cur, "n/a");
+        u = scr_put(y, c->x + xo, w, ST(P_SOFT, P_BOX, A_BOLD), GMDEF[id].name) + 1;
+        u += scr_put(y, c->x + xo + u, w - u, ST(m->ok ? P_TEXT : P_FAINT, P_BOX, A_BOLD), cur) + 1;
+        if (m->n && w - u > 12) {
+            gm_stats(id, st, sizeof st);
+            scr_rput(y, c->x + xo + u, w - u, ST(P_FAINT, P_BOX, 0), st);
+        }
+    }
+    for (r = 0; r < 2; r++)
+        if ((y = gc_y(c, 1 + r)) >= 0) spark_row(y, c->x + xo, w, 2, r, m->h, G.hpos, G.hn, GHIST, vmax, P_BOX);
+}
+
+/* Two graphs side by side when there is room; b < 0 for one. */
+static void gc_sparks(GCtx *c, int a, double va, int b, double vb)
+{
+    if (c->w >= 110 && b >= 0) {
+        int w1 = (c->w - 3) / 2;
+        gc_spark_at(c, 0, w1, a, va);
+        gc_spark_at(c, w1 + 3, c->w - w1 - 3, b, vb);
+        c->row += 4;
+        return;
+    }
+    gc_spark_at(c, 0, c->w, a, va);
+    c->row += 4;
+    if (b >= 0) {
+        gc_spark_at(c, 0, c->w, b, vb);
+        c->row += 4;
+    }
+}
+
+/* process table columns; NAME takes what is left after PID */
+enum { PC_PID, PC_GPU, PC_AVG, PC_PEAK, PC_TIME, PC_W, PC_Q, PC_GFX, PC_MEM, PC_LAST, PC_API, PC_N };
+static const struct { const char *name; int w, pri; } PCOL[PC_N] = {
+    { "PID", 7, 0 },       { "GPU%", 6, 0 },     { "AVG%", 6, 1 },   { "PEAK%", 6, 4 },
+    { "GPU TIME", 10, 2 }, { "EST W", 8, 5 },    { "QUEUES", 7, 6 }, { "GFX MEM", 8, 3 },
+    { "FOOTPRINT", 9, 5 }, { "LAST SUBMIT", 11, 3 }, { "API", 9, 7 },
+};
+typedef struct { int on[PC_N], x[PC_N], namex, namew; } PLayout;
+
+static void pcol_layout(int w, PLayout *L)
+{
+    int pri, i, need, x;
+    memset(L, 0, sizeof *L);
+    for (pri = 0; pri <= 7; pri++) {
+        need = 2 + 18;
+        for (i = 0; i < PC_N; i++)
+            if (L->on[i] || PCOL[i].pri == pri) need += PCOL[i].w + 1;
+        if (need > w) break;
+        for (i = 0; i < PC_N; i++)
+            if (PCOL[i].pri == pri) L->on[i] = 1;
+    }
+    L->x[PC_PID] = 2;
+    L->namex = 2 + PCOL[PC_PID].w + 2;
+    need = 0;
+    for (i = 1; i < PC_N; i++)
+        if (L->on[i]) need += PCOL[i].w + 1;
+    L->namew = w - L->namex - need;
+    if (L->namew < 4) L->namew = 4;
+    x = L->namex + L->namew;
+    for (i = 1; i < PC_N; i++)
+        if (L->on[i]) {
+            L->x[i] = x + 1;
+            x += PCOL[i].w + 1;
+        }
+}
+
+static int gs_col(int s) { return s == GS_AVG ? PC_AVG : s == GS_TIME ? PC_TIME : s == GS_GFX ? PC_GFX : s == GS_PID ? PC_PID : PC_GPU; }
+
+static void gpu_phdr(int y, int x, int w, const PLayout *L)
+{
+    int i, sc = gs_col(G.sort);
+    St s = ST(P_DIM, P_SEL, A_BOLD), on = ST(P_BRIGHT, P_ACC_BG, A_BOLD);
+    scr_fill(y, x, w, s);
+    for (i = 0; i < PC_N; i++)
+        if (L->on[i]) scr_rput(y, x + L->x[i], PCOL[i].w, i == sc ? on : s, PCOL[i].name);
+    scr_put(y, x + L->namex, L->namew, s, "NAME");
+}
+
+static void gpu_prow(int y, int x, int w, const PLayout *L, const GClient *c, int sel, int focus)
+{
+    int bg = sel ? P_SEL : P_BOX, base = c->alive ? P_SOFT : P_FAINT, i;
+    char t[48];
+    scr_fill(y, x, w, ST(base, bg, 0));
+    if (focus) scr_put(y, x, 2, ST(P_ACCENT, bg, A_BOLD), "\xe2\x97\x86");
+    else if (sel) scr_put(y, x, 2, ST(P_ACCENT, bg, A_BOLD), "\xe2\x96\xb6");
+    for (i = 0; i < PC_N; i++) {
+        int col = base;
+        if (!L->on[i]) continue;
+        switch (i) {
+        case PC_PID: snprintf(t, sizeof t, "%d", c->pid); col = P_DIM; break;
+        case PC_GPU:
+            snprintf(t, sizeof t, c->cur < 100 ? "%.1f" : "%.0f", c->cur);
+            col = c->alive ? cpu_val_col(c->cur) : P_FAINT;
+            break;
+        case PC_AVG: snprintf(t, sizeof t, "%.1f", gcl_avg(c)); col = c->alive ? cpu_val_col(gcl_avg(c)) : P_FAINT; break;
+        case PC_PEAK: snprintf(t, sizeof t, "%.1f", c->peak); break;
+        case PC_TIME: fmt_cputime(c->ns - c->ns0, t, sizeof t); col = P_DIM; break;
+        case PC_W:
+            if (c->alive && G.has_gpu_w) fmt_power(c->est_w, t, sizeof t);
+            else snprintf(t, sizeof t, "-");
+            break;
+        case PC_Q: snprintf(t, sizeof t, "%d/%d", c->queues, c->qmax); col = P_DIM; break;
+        case PC_GFX:
+            if (c->gfx >= 0) fmt_mem((uint64_t)c->gfx, t, sizeof t);
+            else snprintf(t, sizeof t, "-");
+            break;
+        case PC_MEM:
+            if (c->phys) fmt_mem(c->phys, t, sizeof t);
+            else snprintf(t, sizeof t, "-");
+            col = P_DIM;
+            break;
+        case PC_LAST: fmt_ago(c->alive ? c->last_sub : 0, t, sizeof t); col = P_DIM; break;
+        case PC_API: api_str(c->api, t, sizeof t); col = P_DIM; break;
+        }
+        if (!c->alive) col = P_FAINT;
+        scr_rput(y, x + L->x[i], PCOL[i].w, ST(col, bg, 0), t);
+    }
+    i = scr_put(y, x + L->namex, L->namew, ST(c->alive ? P_BRIGHT : P_DIM, bg, c->alive ? A_BOLD : A_STRIKE), c->name);
+    if (!c->alive && i + 9 < L->namew) scr_put(y, x + L->namex + i + 1, L->namew - i - 1, ST(P_HOT, bg, 0), "gone");
+}
+
+/* Name, stats and history of one process. */
+static void gpu_detail(GCtx *c, const GClient *fc)
+{
+    char a[32], b[32], d[32], q[32], t[96];
+    int y, r;
+    double mx = 100;
+    for (r = 0; r < GPH && r < fc->hn; r++)
+        if (fc->hist[r] > mx) mx = fc->hist[r];
+    gc_kv(c, P_TEXT, "GPU", "%.1f%% now \xc2\xb7 %.1f%% avg \xc2\xb7 %.1f%% peak", fc->cur, gcl_avg(fc), fc->peak);
+    fmt_cputime(fc->ns, a, sizeof a);
+    fmt_cputime(fc->ns - fc->ns0, b, sizeof b);
+    t[0] = 0;
+    if (G.has_gpu_w && fc->alive) {
+        fmt_power(fc->est_w, d, sizeof d);
+        snprintf(t, sizeof t, " \xc2\xb7 est. power %s (its share of GPU time)", d);
+    }
+    gc_kv(c, P_TEXT, "GPU time", "%s total \xc2\xb7 %s this session%s", a, b, t);
+    fmt_mem(fc->phys, d, sizeof d);
+    if (fc->gfx >= 0) {
+        fmt_mem((uint64_t)fc->gfx, a, sizeof a);
+        fmt_mem(fc->gfx_peak > 0 ? (uint64_t)fc->gfx_peak : 0, b, sizeof b);
+        snprintf(t, sizeof t, "%s (peak %s)", a, b);
+    } else {
+        snprintf(t, sizeof t, "n/a (another user's process: run with sudo)");
+    }
+    gc_kv(c, P_TEXT, "Memory", "graphics %s \xc2\xb7 footprint %s", t, fc->phys ? d : "-");
+    api_str(fc->api, q, sizeof q);
+    if (fc->alive) {
+        fmt_ago(fc->last_sub, a, sizeof a);
+        gc_kv(c, P_TEXT, "Submission", "last %s ago \xc2\xb7 %d command queue%s (max %d) \xc2\xb7 %d GPU connection%s \xc2\xb7 %s", a,
+              fc->queues, fc->queues == 1 ? "" : "s", fc->qmax, fc->nclients, fc->nclients == 1 ? "" : "s", q);
+    } else {
+        fmt_dur(G.t_last - fc->gone_t, a, sizeof a);
+        gc_kv(c, P_HOT, "Submission", "gone %s ago \xc2\xb7 %s", a, q);
+    }
+    if ((y = gc_y(c, 0)) >= 0) scr_put(y, c->x, GKW - 1, ST(P_DIM, P_BOX, 0), "GPU% history");
+    for (r = 0; r < 2; r++)
+        if ((y = gc_y(c, r)) >= 0)
+            spark_row(y, c->x + GKW, c->w - GKW, 2, r, fc->hist, fc->hn ? (fc->hn - 1) % GPH : 0,
+                      fc->hn < GPH ? fc->hn : GPH, GPH, mx, P_BOX);
+    c->row += 2;
+}
+
+static void gpu_tab_overview(GCtx *c)
+{
+    char v[64], a[16], b[16];
+    uint64_t ml = gpu_mem_limit(), lim = ml ? ml : S.mem_total;
+    double f;
+    GClient *fc;
+    PLayout L;
+    int i, n, y;
+
+    gc_head(c, "Now");
+    gm_fmt(GM_UTIL, S.gpu_util * 100, v, sizeof v);
+    gc_metric(c, GM_UTIL, S.gpu_util, v, 1);
+    gm_fmt(GM_REND, S.gpu_rend, v, sizeof v);
+    gc_metric(c, GM_REND, S.gpu_rend / 100, v, 1);
+    gm_fmt(GM_TILER, S.gpu_tiler, v, sizeof v);
+    gc_metric(c, GM_TILER, S.gpu_tiler / 100, v, 1);
+    gm_fmt(GM_ACTIVE, G.active_res, v, sizeof v);
+    gc_metric(c, GM_ACTIVE, G.active_res / 100, v, 1);
+    if (G.mhz > 0) snprintf(v, sizeof v, "%.0f / %.0f MHz", G.mhz, G.fmax);
+    else snprintf(v, sizeof v, "idle");
+    gc_metric(c, GM_FREQ, G.fmax > 0 ? G.mhz / G.fmax : 0, v, 0);
+    fmt_power(G.gpu_w, v, sizeof v);
+    gc_metric(c, GM_POWER, G.gpu_w / gm_ringmax(GM_POWER, 1), v, 0);
+    snprintf(v, sizeof v, "%.1f\xc2\xb0" "C max %.1f", G.temp, G.tmax);
+    gc_metric(c, GM_TEMP, G.tmax / 110, v, 0);
+    fmt_mem(S.gpu_mem, a, sizeof a);
+    fmt_mem(lim, b, sizeof b);
+    snprintf(v, sizeof v, "%s / %s%s", a, b, ml ? "" : " RAM");
+    f = lim ? (double)S.gpu_mem / (double)lim : 0;
+    gc_metric(c, GM_MEM, f, v, 1);
+    gm_fmt(GM_BW, G.bw_rd + G.bw_wr, v, sizeof v);
+    gc_metric(c, GM_BW, (G.bw_rd + G.bw_wr) / gm_ringmax(GM_BW, 1), v, 0);
+    if (G.has_dram_w) {
+        fmt_power(G.dram_w, v, sizeof v);
+        gc_metric(c, GM_DRAMW, G.dram_w / gm_ringmax(GM_DRAMW, 1), v, 0);
+    }
+
+    gc_head(c, "History");
+    gc_sparks(c, GM_UTIL, 100, GM_POWER, gm_ringmax(GM_POWER, 1));
+    gc_sparks(c, GM_FREQ, G.fmax > 0 ? G.fmax : gm_ringmax(GM_FREQ, 1), GM_TMAX, 110);
+    gc_sparks(c, GM_MEM, (double)lim, GM_BW, gm_ringmax(GM_BW, 1));
+
+    gc_head(c, "GPU processes");
+    pcol_layout(c->w, &L);
+    if ((y = gc_y(c, 0)) >= 0) gpu_phdr(y, c->x, c->w, &L);
+    c->row++;
+    fc = gpu_focus();
+    for (i = 0, n = 0; i < G.nord && n < 8; i++) {
+        const GClient *cl = &G.cl[G.ord[i]];
+        if (!cl->alive) continue;
+        if ((y = gc_y(c, 0)) >= 0) gpu_prow(y, c->x, c->w, &L, cl, 0, cl == fc);
+        c->row++;
+        n++;
+    }
+    if (!n) gc_kv(c, P_FAINT, "", "no process is using the GPU");
+
+    if (fc) {
+        char t[160];
+        snprintf(t, sizeof t, "Focus \xc2\xb7 %s (%d) \xc2\xb7 %s", fc->name, fc->pid,
+                 G.focus >= 0 ? "pinned" : G.query ? "matching -p" : "busiest");
+        gc_head(c, t);
+        gpu_detail(c, fc);
+    }
+}
+
+static void gpu_tab_procs(int x, int y, int w, int h)
+{
+    PLayout L;
+    GClient *fc = gpu_focus();
+    int detail = h >= 20 ? 8 : 0, lh = h - 1 - detail, i;
+    pcol_layout(w, &L);
+    gpu_phdr(y, x, w, &L);
+    G.list_y = y + 1;
+    G.list_h = lh;
+    if (G.sel >= G.nord) G.sel = G.nord ? G.nord - 1 : 0;
+    if (G.sel < 0) G.sel = 0;
+    if (G.top > G.sel) G.top = G.sel;
+    if (G.sel >= G.top + lh) G.top = G.sel - lh + 1;
+    if (G.top > G.nord - lh) G.top = G.nord - lh;
+    if (G.top < 0) G.top = 0;
+    for (i = 0; i < lh && G.top + i < G.nord; i++) {
+        const GClient *c = &G.cl[G.ord[G.top + i]];
+        gpu_prow(y + 1 + i, x, w, &L, c, G.top + i == G.sel, c == fc);
+    }
+    if (!G.nord) scr_put(y + 1, x + 2, w - 2, ST(P_FAINT, P_BOX, A_ITAL), "(no process has used the GPU yet)");
+    if (G.nord) G.sel_pid = G.cl[G.ord[G.sel]].pid;
+    if (detail && G.nord) {
+        const GClient *c = &G.cl[G.ord[G.sel]];
+        GCtx d = { x, y + 1 + lh, w, detail, 0, 0 };
+        char t[160];
+        snprintf(t, sizeof t, "%s (%d)%s", c->name, c->pid, c == fc && G.focus >= 0 ? " \xc2\xb7 pinned focus" : "");
+        gc_head(&d, t);
+        gpu_detail(&d, c);
+    }
+}
+
+static void gst_rows(GCtx *c, const GStates *st, int skip_idle)
+{
+    double act = 0, cact = 0;
+    int i;
+    for (i = 0; i < st->n; i++)
+        if (!skip_idle || strcmp(st->name[i], "IDLE_OFF")) { act += st->res[i]; cact += st->cum[i]; }
+    for (i = 0; i < st->n; i++) {
+        char v[32], s[64];
+        double f = act > 0 ? st->res[i] / act : 0, cf = cact > 0 ? st->cum[i] / cact : 0;
+        int lim = pc_limiting(st->name[i]);
+        if ((skip_idle && !strcmp(st->name[i], "IDLE_OFF")) || st->cum[i] <= 0) continue;
+        snprintf(v, sizeof v, "%.1f%%", f * 100);
+        snprintf(s, sizeof s, "session %.1f%%%s", cf * 100, lim ? " \xc2\xb7 limiting" : "");
+        gc_meter(c, st->name[i], f, lim ? P_WARN : P_BAR, v, lim && f > 0 ? P_WARN : P_TEXT, s);
+    }
+}
+
+static void gpu_tab_clock(GCtx *c)
+{
+    char a[32], b[32], d[32], lim[96];
+    double lf, slf, csum = 0, cres = 0;
+    int i;
+    gc_head(c, "Clock (GPU performance states)");
+    if (!G.ior) {
+        gc_kv(c, P_WARN, "", "IOReport is unavailable: no clocks, power or limits on this Mac");
+    } else {
+        for (i = 0; i < G.ps.n; i++) {
+            int p = gst_pnum(G.ps.name[i]);
+            if (p > 0 && p <= G.nfreq) { csum += G.freq[p - 1] * G.ps.cum[i]; cres += G.ps.cum[i]; }
+        }
+        if (G.mhz > 0) gc_kv(c, P_TEXT, "Now", "%.0f MHz average while active \xc2\xb7 %.1f%% active residency \xc2\xb7 max %.0f MHz",
+                             G.mhz, G.active_res, G.fmax);
+        else gc_kv(c, P_DIM, "Now", "idle \xc2\xb7 max %.0f MHz", G.fmax);
+        if (cres > 0) gc_kv(c, P_TEXT, "Session", "%.0f MHz average while active \xc2\xb7 %.1f%% active residency", csum / cres,
+                            G.ps.cumtot > 0 ? 100 - gst_frac(&G.ps, "OFF", 1) * 100 : 0);
+        for (i = 0; i < G.ps.n; i++) {
+            char k[32], v[32], s[64];
+            int p = gst_pnum(G.ps.name[i]);
+            double f = G.ps.tot > 0 ? G.ps.res[i] / G.ps.tot : 0, cf = G.ps.cumtot > 0 ? G.ps.cum[i] / G.ps.cumtot : 0;
+            if (p > G.nfreq && G.ps.cum[i] <= 0) continue;
+            if (p > 0 && p <= G.nfreq) snprintf(k, sizeof k, "%-4s %5.0f MHz", G.ps.name[i], G.freq[p - 1]);
+            else snprintf(k, sizeof k, "%s", p ? G.ps.name[i] : "idle (off)");
+            snprintf(v, sizeof v, "%.1f%%", f * 100);
+            snprintf(s, sizeof s, "session %.1f%%", cf * 100);
+            gc_meter(c, k, f, p ? P_BAR : P_GUIDE, v, f > 0 ? P_TEXT : P_FAINT, s);
+        }
+    }
+
+    gc_head(c, "Power");
+    fmt_power(G.gpu_w, a, sizeof a);
+    fmt_power(gm_avg(GM_POWER), b, sizeof b);
+    fmt_power(G.m[GM_POWER].mx, d, sizeof d);
+    if (G.has_gpu_w) gc_kv(c, P_TEXT, "GPU", "%s now \xc2\xb7 %s avg \xc2\xb7 %s peak", a, b, d);
+    else gc_kv(c, P_FAINT, "GPU", "n/a");
+    fmt_dur(G.t_last - G.t_reset, a, sizeof a);
+    if (G.has_gpu_w) gc_kv(c, P_TEXT, "GPU energy", "%.1f J (%.4f Wh) in %s", G.energy_j, G.energy_j / 3600, a);
+    if (G.has_dram_w) {
+        fmt_power(G.dram_w, a, sizeof a);
+        gc_kv(c, P_TEXT, "DRAM", "%s now \xc2\xb7 %.1f J this session", a, G.dram_j);
+    }
+    if (G.has_ane_w) { fmt_power(G.ane_w, a, sizeof a); gc_kv(c, P_TEXT, "ANE", "%s", a); }
+    if (G.has_cpu_w) { fmt_power(G.cpu_w, a, sizeof a); gc_kv(c, P_TEXT, "CPU", "%s", a); }
+    if (S.sys_w >= 0) { fmt_power(S.sys_w, a, sizeof a); gc_kv(c, P_TEXT, "System", "%s (battery/adapter)", a); }
+    if (G.has_ppm) gc_kv(c, G.ppm < 99.5 ? P_WARN : P_TEXT, "Power target", "%.0f%% of maximum GPU power", G.ppm);
+
+    gc_head(c, "Limits & throttling");
+    lf = gpu_limit(lim, sizeof lim, 0);
+    slf = gpu_limit(NULL, 0, 1);
+    gc_kv(c, lf > 0 ? P_WARN : P_TEXT, "Clock limited", "%.1f%% of active time%s%s%s \xc2\xb7 session %.1f%%", lf * 100,
+          lim[0] ? " by " : "", lim, "", slf * 100);
+    gc_kv(c, gst_out(&G.cltm, "NO_CLTM", 0) > 0 ? P_WARN : P_TEXT, "Thermal (CLTM)", "%.1f%% now \xc2\xb7 session %.1f%%",
+          gst_out(&G.cltm, "NO_CLTM", 0) * 100, gst_out(&G.cltm, "NO_CLTM", 1) * 100);
+    gc_kv(c, gst_out(&G.pmu, "NONE", 0) > 0 ? P_WARN : P_TEXT, "Perf lost (PMU)", "%.1f%% now \xc2\xb7 session %.1f%%",
+          gst_out(&G.pmu, "NONE", 0) * 100, gst_out(&G.pmu, "NONE", 1) * 100);
+    gc_kv(c, gst_out(&G.pz, "NO_ZONE", 0) > 0 ? P_WARN : P_TEXT, "Power zones", "%.1f%% now \xc2\xb7 session %.1f%%",
+          gst_out(&G.pz, "NO_ZONE", 0) * 100, gst_out(&G.pz, "NO_ZONE", 1) * 100);
+    gc_kv(c, G.throttle_tot ? P_WARN : P_TEXT, "Throttle events", "%ld this sample \xc2\xb7 %ld this session", G.throttle,
+          G.throttle_tot);
+    gc_kv(c, P_DIM, "", "Power controller residency over active time:");
+    gst_rows(c, &G.pc, 1);
+
+    gc_head(c, "Temperature (SMC GPU sensors)");
+    if (G.has_temp)
+        gc_kv(c, G.tmax >= 95 ? P_HOT : G.tmax >= 85 ? P_WARN : P_TEXT, "GPU", "avg %.1f\xc2\xb0" "C \xc2\xb7 max %.1f\xc2\xb0" "C \xc2\xb7 session max %.1f\xc2\xb0" "C \xc2\xb7 %d sensors",
+              G.temp, G.tmax, G.tmax_peak, G.ntemp);
+    else gc_kv(c, P_FAINT, "GPU", "no GPU temperature sensors found");
+}
+
+static void gpu_tab_mem(GCtx *c)
+{
+    char a[32], b[32], d[32], v[64], st[128];
+    uint64_t ml = gpu_mem_limit(), lim = ml ? ml : S.mem_total;
+    int i, n;
+    gc_head(c, "GPU memory (driver)");
+    fmt_mem(S.gpu_mem, a, sizeof a);
+    fmt_mem(lim, b, sizeof b);
+    snprintf(v, sizeof v, "%s / %s", a, b);
+    gm_stats(GM_MEM, st, sizeof st);
+    gc_meter(c, "In use", lim ? (double)S.gpu_mem / (double)lim : 0, grad_col(lim ? (double)S.gpu_mem / (double)lim : 0), v,
+             P_TEXT, st);
+    fmt_mem(S.gpu_alloc, a, sizeof a);
+    gc_kv(c, P_TEXT, "Allocated", "%s", a);
+    fmt_mem(S.gpu_drv, a, sizeof a);
+    gc_kv(c, P_TEXT, "Driver", "%s", a);
+    fmt_mem(S.gpu_pb, a, sizeof a);
+    fmt_mem(S.gpu_tiled, b, sizeof b);
+    gc_kv(c, P_TEXT, "Parameter buffer", "%s \xc2\xb7 tiled scenes %s \xc2\xb7 %lld split scenes", a, b, (long long)S.gpu_split);
+    if (ml) {
+        fmt_mem(ml > S.gpu_mem ? ml - S.gpu_mem : 0, a, sizeof a);
+        gc_kv(c, P_TEXT, "Wired limit", "%ld MB (sysctl iogpu.wired_limit_mb) \xc2\xb7 %s headroom", G.wired_mb, a);
+    } else {
+        gc_kv(c, P_TEXT, "Wired limit", "macOS default (sysctl iogpu.wired_limit_mb = 0)");
+    }
+    gc_kv(c, S.gpu_recov ? P_HOT : P_TEXT, "Recoveries", "%lld (driver recoveryCount) \xc2\xb7 %ld GPU restarts this session",
+          (long long)S.gpu_recov, G.restarts_tot);
+
+    gc_head(c, "Unified memory (system)");
+    fmt_mem(S.mem_used, a, sizeof a);
+    fmt_mem(S.mem_total, b, sizeof b);
+    snprintf(v, sizeof v, "%s / %s", a, b);
+    gc_meter(c, "Used", S.mem_total ? (double)S.mem_used / (double)S.mem_total : 0,
+             S.pressure >= 4 ? P_HOT : S.pressure >= 2 ? P_WARN : P_BAR, v, P_TEXT, NULL);
+    fmt_mem(S.mem_app, a, sizeof a);
+    fmt_mem(S.mem_wired, b, sizeof b);
+    fmt_mem(S.mem_comp, d, sizeof d);
+    gc_kv(c, P_TEXT, "Breakdown", "app %s \xc2\xb7 wired %s \xc2\xb7 compressed %s", a, b, d);
+    fmt_mem(S.swap_used, a, sizeof a);
+    fmt_mem(S.swap_total, b, sizeof b);
+    gc_kv(c, S.swap_used ? P_WARN : P_TEXT, "Swap", "%s / %s", a, b);
+    gc_kv(c, S.pressure >= 4 ? P_HOT : S.pressure >= 2 ? P_WARN : P_TEXT, "Pressure", "%s", pressure_name(S.pressure));
+
+    gc_head(c, "Bandwidth (DRAM controllers, whole SoC)");
+    if (G.has_bw) {
+        gm_fmt(GM_BW, G.bw_rd + G.bw_wr, v, sizeof v);
+        gc_metric(c, GM_BW, (G.bw_rd + G.bw_wr) / gm_ringmax(GM_BW, 1), v, 0);
+        gc_kv(c, P_TEXT, "Read / write", "%.1f GB/s read \xc2\xb7 %.1f GB/s write", G.bw_rd, G.bw_wr);
+    } else {
+        gc_kv(c, P_FAINT, "DRAM", "no memory controller counters on this Mac");
+    }
+    if (G.has_lat) gc_kv(c, P_TEXT, "GPU mem latency", "%.0f cycles average", G.lat);
+
+    gc_head(c, "GPU processes by graphics memory");
+    {
+        int idx[GMAXCL], k;
+        for (i = 0, n = 0; i < G.ncl; i++)
+            if (G.cl[i].alive && G.cl[i].gfx > 0) idx[n++] = i;
+        for (i = 1; i < n; i++) /* insertion sort, largest first */
+            for (k = i; k > 0 && G.cl[idx[k]].gfx > G.cl[idx[k - 1]].gfx; k--) {
+                int t = idx[k];
+                idx[k] = idx[k - 1];
+                idx[k - 1] = t;
+            }
+        for (i = 0; i < n && i < 12; i++) {
+            const GClient *cl = &G.cl[idx[i]];
+            char k2[64];
+            fmt_mem((uint64_t)cl->gfx, a, sizeof a);
+            fmt_mem((uint64_t)cl->gfx_peak, b, sizeof b);
+            fmt_mem(cl->phys, d, sizeof d);
+            snprintf(k2, sizeof k2, "%s", cl->name);
+            gc_kv(c, P_TEXT, k2, "%s graphics (peak %s) \xc2\xb7 footprint %s \xc2\xb7 pid %d", a, b, cl->phys ? d : "-", cl->pid);
+        }
+        if (!n) gc_kv(c, P_FAINT, "", "none readable (other users' processes need sudo)");
+    }
+}
+
+static void gpu_tab_events(GCtx *c)
+{
+    unsigned long e;
+    int any = 0;
+    gc_head(c, "Events (newest first)");
+    for (e = G.nev; e > 0 && G.nev - e < GNEV; e--) {
+        const GEvent *ev = &G.ev[(e - 1) % GNEV];
+        struct tm tm;
+        char ts[16];
+        localtime_r(&ev->t, &tm);
+        strftime(ts, sizeof ts, "%H:%M:%S", &tm);
+        gc_kv(c, ev->sev >= 2 ? P_HOT : ev->sev ? P_WARN : P_SOFT, ts, "%s", ev->s);
+        any = 1;
+    }
+    if (!any) gc_kv(c, P_FAINT, "", "nothing yet: processes starting or stopping GPU work, clock limits, thermal");
+    if (!any) gc_kv(c, P_FAINT, "", "limiting, throttling, GPU restarts and memory pressure show up here");
+}
+
+static void draw_gpu(double now)
+{
+    int bw = SC.w, bh = SC.h - 2, w, h, x, y, i, cx, cy, cw, ch, chx;
+    double e;
+    char title[192], dur[32], chip[96];
+    if (!G.on) return;
+    e = ease_out((now - G.t0) / 0.22);
+    w = (int)(24 + (bw - 24) * e);
+    h = (int)(5 + (bh - 5) * e);
+    x = (bw - w) / 2;
+    y = 1 + (bh - h) / 2;
+    i = snprintf(title, sizeof title, "GPU \xc2\xb7 %s", G.name);
+    if (G.cores) i += snprintf(title + i, sizeof title - (size_t)i, " \xc2\xb7 %d-core %s", G.cores, G.family);
+    if (G.driver[0]) snprintf(title + i, sizeof title - (size_t)i, " \xc2\xb7 driver %s", G.driver);
+    draw_box(y, x, w, h, P_ACCENT, title);
+    if (e < 1 || h < 10 || w < 50) return;
+    /* chips on the top border, right to left */
+    fmt_dur(G.t_last - G.t_reset, dur, sizeof dur);
+    snprintf(chip, sizeof chip, " session %s \xc2\xb7 %.2gs ", dur, U.interval);
+    chx = x + w - 3 - str_width(chip);
+    scr_put(y, chx, str_width(chip), ST(P_SOFT, P_BOX, 0), chip);
+    if (U.paused) { chx -= 9; scr_put(y, chx, 8, ST(16, P_WARN, A_BOLD), " PAUSED "); }
+    if (G.was_thermal) { chx -= 10; scr_put(y, chx, 9, ST(16, P_HOT, A_BOLD), " THERMAL "); }
+    if (G.was_limit) { chx -= 10; scr_put(y, chx, 9, ST(16, P_WARN, A_BOLD), " LIMITED "); }
+    G.tab_y = y + 1;
+    {
+        int tx = x + 2;
+        for (i = 0; i < GT_N; i++) {
+            char t[48];
+            snprintf(t, sizeof t, " %s ", GT_LABEL[i]);
+            G.tab_x[i] = tx;
+            tx += scr_put(y + 1, tx, x + w - 2 - tx, i == G.tab ? ST(P_BRIGHT, P_ACC_BG, A_BOLD) : ST(P_DIM, P_SEL, 0), t) + 1;
+        }
+        G.tab_x[GT_N] = tx;
+    }
+    cx = x + 2;
+    cy = y + 3;
+    cw = w - 4;
+    ch = h - 5;
+    G.view_h = ch;
+    if (!G.primed || !G.samples) {
+        scr_printf(cy + 1, cx + 1, cw - 2, ST(P_ACCENT, P_BOX, A_BOLD), "%s Collecting the first GPU sample\xe2\x80\xa6",
+                   SPIN[(int)(now * 12) % 10]);
+    } else if (G.tab == GT_PROC) {
+        gpu_tab_procs(cx, cy, cw, ch);
+    } else {
+        GCtx c;
+        if (G.scroll > G.total - ch) G.scroll = G.total - ch;
+        if (G.scroll < 0) G.scroll = 0;
+        c.x = cx;
+        c.y = cy;
+        c.w = cw - 1;
+        c.h = ch;
+        c.row = 0;
+        c.scroll = G.scroll;
+        if (G.tab == GT_OVER) gpu_tab_overview(&c);
+        else if (G.tab == GT_CLOCK) gpu_tab_clock(&c);
+        else if (G.tab == GT_MEM) gpu_tab_mem(&c);
+        else gpu_tab_events(&c);
+        G.total = c.row;
+        if (G.total > ch) {
+            int th = ch * ch / G.total, ty;
+            if (th < 1) th = 1;
+            ty = (int)((double)G.scroll / (double)(G.total - ch) * (ch - th) + 0.5);
+            for (i = 0; i < ch; i++)
+                set_cell(cy + i, cx + cw - 1, ST(i >= ty && i < ty + th ? 75 : 237, P_BOX, 0),
+                         i >= ty && i < ty + th ? "\xe2\x94\x83" : "\xe2\x94\x82", 3, 1);
+        }
+    }
+    scr_put(y + h - 2, x + 2, w - 4, ST(P_FAINT, P_BOX, 0),
+            "\xe2\x86\x90\xe2\x86\x92 Tab tabs \xc2\xb7 \xe2\x86\x91\xe2\x86\x93 scroll/select \xc2\xb7 Enter pin focus \xc2\xb7 s sort ("
+            "Processes) \xc2\xb7 r reset stats \xc2\xb7 k signal \xc2\xb7 , . interval \xc2\xb7 z pause \xc2\xb7 Esc/g close");
+    if (G.tab == GT_PROC && x + w - 4 - 30 > x + 2) {
+        char t[48];
+        snprintf(t, sizeof t, "sort: %s", GS_LABEL[G.sort]);
+        scr_rput(y + h - 1, x + w - 3 - str_width(t) - 2, str_width(t) + 2, ST(P_SOFT, P_BOX, 0), t);
+    }
+}
+
+static void gpu_open(Proc *p)
+{
+    int i;
+    gpu_activate();
+    G.on = 1;
+    G.t0 = now_s();
+    G.scroll = 0;
+    for (i = 0; p && i < G.ncl; i++) {
+        GClient *c = &G.cl[i];
+        if (c->alive && c->pid == p->pid && c->start_s == p->start_s && c->start_us == p->start_us) {
+            G.focus = c->pid;
+            G.focus_s = c->start_s;
+            G.focus_us = c->start_us;
+        }
+    }
+}
+
+static void gpu_close(void) { G.on = 0; }
+
+/* Pins the focus on the selected process; again on it returns to automatic. */
+static void gpu_pin(void)
+{
+    GClient *c;
+    if (G.sel < 0 || G.sel >= G.nord) return;
+    c = &G.cl[G.ord[G.sel]];
+    if (G.focus == c->pid && G.focus_s == c->start_s && G.focus_us == c->start_us) {
+        G.focus = -1;
+        gpu_event(0, "Focus back to the busiest process");
+    } else {
+        G.focus = c->pid;
+        G.focus_s = c->start_s;
+        G.focus_us = c->start_us;
+    }
+}
+
+static Proc *gpu_sel_proc(void)
+{
+    const GClient *c;
+    Proc *p;
+    if (G.sel < 0 || G.sel >= G.nord) return NULL;
+    c = &G.cl[G.ord[G.sel]];
+    p = c->alive && c->pid < PID_CAP ? bypid[c->pid] : NULL;
+    return p && p->start_s == c->start_s && p->start_us == c->start_us ? p : NULL;
+}
+
+static void toggle_pause(void);
+static void step_interval(int k);
+static void kill_menu(Proc *single);
+static void relaunch_sudo(void);
+
+static int gpu_key(int k)
+{
+    int page = G.view_h > 2 ? G.view_h - 2 : 1, proc = G.tab == GT_PROC, i;
+    switch (k) {
+    case K_ESC: case 'q': case 'g': gpu_close(); break;
+    case 3: case K_F(10): return 0;
+    case K_F(1): case '?': case 'h': U.help = 1; break;
+    case K_LEFT: case K_BTAB: G.tab = (G.tab + GT_N - 1) % GT_N; G.scroll = 0; break;
+    case K_RIGHT: case '\t': G.tab = (G.tab + 1) % GT_N; G.scroll = 0; break;
+    case K_UP: if (proc) G.sel--; else G.scroll--; break;
+    case K_DOWN: if (proc) G.sel++; else G.scroll++; break;
+    case K_PGUP: if (proc) G.sel -= G.list_h > 1 ? G.list_h - 1 : 1; else G.scroll -= page; break;
+    case K_PGDN: case ' ': if (proc) G.sel += G.list_h > 1 ? G.list_h - 1 : 1; else G.scroll += page; break;
+    case K_HOME: G.sel = 0; G.scroll = 0; break;
+    case K_END: G.sel = G.nord - 1; G.scroll = 1 << 30; break;
+    case '\r': case '\n': case 'f': if (proc) gpu_pin(); else G.tab = GT_PROC; break;
+    case 's':
+        G.sort = (G.sort + 1) % GS_N;
+        gpu_order();
+        break;
+    case 'r': gpu_reset(); break;
+    case 'k': case K_F(9): case K_DEL: if (gpu_sel_proc()) kill_menu(gpu_sel_proc()); break;
+    case 'z': toggle_pause(); break;
+    case ',': case '.': step_interval(k); break;
+    case 'S': relaunch_sudo(); break;
+    case K_MOUSE:
+        if (MS.b == 64 || MS.b == 65) {
+            int d = MS.b == 64 ? -3 : 3;
+            if (proc) G.sel += d;
+            else G.scroll += d;
+        } else if (MS.press && MS.b == 0 && MS.y == G.tab_y) {
+            for (i = 0; i < GT_N; i++)
+                if (MS.x >= G.tab_x[i] && MS.x < G.tab_x[i + 1]) { G.tab = i; G.scroll = 0; }
+        } else if (MS.press && MS.b == 0 && MS.y == SC.h - 1) {
+            for (i = 0; i < NFOOT; i++)
+                if (MS.x >= g_foot_x[i] && MS.x < g_foot_x[i + 1]) return gpu_key(FOOT[i].key);
+        } else if (MS.press && proc && MS.y >= G.list_y && MS.y < G.list_y + G.list_h) {
+            int idx = G.top + MS.y - G.list_y;
+            double t = now_s();
+            if (idx >= G.nord) break;
+            G.sel = idx;
+            if (MS.b == 2) { if (gpu_sel_proc()) kill_menu(gpu_sel_proc()); break; }
+            if (MS.b == 0 && idx == G.click_row && t - G.click_t < 0.4) { gpu_pin(); G.click_t = 0; break; }
+            G.click_row = idx;
+            G.click_t = t;
+        }
+        break;
+    }
+    if (G.sel >= G.nord) G.sel = G.nord - 1;
+    if (G.sel < 0) G.sel = 0;
+    if (G.scroll < 0) G.scroll = 0;
+    if (proc && G.nord) G.sel_pid = G.cl[G.ord[G.sel]].pid;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
 /* frame loop                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -3091,7 +4788,8 @@ static void tick(double now)
         if (p->died > 0 || (p->born > 0 && now - p->born < NEWBORN_SEC)) g_soon = 1;
     }
     if (now - U.anim_t0 < ROW_ANIM + ROW_STAGGER * U.list_h + 0.05 || now - U.sel_t < 1.4 ||
-        now - U.pulse_t < 0.8 || (IN.on && now - IN.t0 < 0.3) || (IN.on && IN.cs_state == 1) || U.input_mode)
+        now - U.pulse_t < 0.8 || (IN.on && now - IN.t0 < 0.3) || (IN.on && IN.cs_state == 1) || U.input_mode ||
+        (G.on && (now - G.t0 < 0.3 || !G.samples)))
         g_anim = 1;
 }
 
@@ -3258,6 +4956,8 @@ static void draw_help(void)
     static const char *lines[] = {
         "\xe2\x86\x91\xe2\x86\x93 PgUp PgDn Home End   move          Space   tag (U untag all, c tag with children)",
         "Enter 2 i          inspect: info, files & sockets, args & env, code signature",
+        "g                  GPU view: utilization, clocks, power, temperature, memory, bandwidth,",
+        "                   limits and per-process GPU use with session stats (r resets them)",
         "Tab Shift-Tab      sort tab: CPU GPU Memory Energy Disk   6 all sort keys   I invert",
         "P M G B D N T      sort by CPU, Memory, GPU, Battery/energy, Disk, PID, Time",
         "5 t                tree view (parent + children); \xe2\x86\x90/\xe2\x86\x92 or -/+ collapse/expand, * all",
@@ -3840,6 +5540,10 @@ static int inspect_key(int k)
     case 'o': reveal(p); break;
     case 'y': copy_path(p); break;
     case 'S': relaunch_sudo(); break;
+    case 'g':
+        inspect_close();
+        gpu_open(p);
+        break;
     case 'r':
         IN.built_tab = -1;
         if (p && IN.tab == IT_SIGN) cs_start(p);
@@ -3907,6 +5611,27 @@ static void mouse_main(void)
     }
 }
 
+static void toggle_pause(void)
+{
+    U.paused = !U.paused;
+    if (!U.paused) U.next_sample = now_s();
+    set_msg(0, U.paused ? "Updates paused (z to resume)" : "Updates resumed");
+}
+
+static void step_interval(int k)
+{
+    static const double IV[] = { 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 };
+    int i, n = (int)(sizeof IV / sizeof IV[0]), cur = 0;
+    for (i = 0; i < n; i++)
+        if (fabs(IV[i] - U.interval) < fabs(IV[cur] - U.interval)) cur = i;
+    cur += k == ',' ? 1 : -1;
+    if (cur < 0) cur = 0;
+    if (cur >= n) cur = n - 1;
+    U.interval = IV[cur];
+    U.next_sample = now_s() + U.interval;
+    set_msg(0, "Refresh every %.2gs", U.interval);
+}
+
 /* Returns 0 to quit. */
 static int handle_key(int k)
 {
@@ -3923,6 +5648,7 @@ static int handle_key(int k)
         return 1;
     }
     if (k >= '0' && k <= '9') k = K_F(k == '0' ? 10 : k - '0'); /* htop F-keys without Fn */
+    if (G.on) return gpu_key(k);
     if (IN.on) return inspect_key(k);
     switch (k) {
     case 'q': case 'Q': case 3: case K_F(10):
@@ -4025,24 +5751,9 @@ static int handle_key(int k)
     case 'p': U.fullpath = !U.fullpath; break;
     case 'o': reveal(p); break;
     case 'y': copy_path(p); break;
-    case 'z':
-        U.paused = !U.paused;
-        if (!U.paused) U.next_sample = now_s();
-        set_msg(0, U.paused ? "Updates paused (z to resume)" : "Updates resumed");
-        break;
-    case ',': case '.': {
-        static const double IV[] = { 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0 };
-        int i, n = (int)(sizeof IV / sizeof IV[0]), cur = 0;
-        for (i = 0; i < n; i++)
-            if (fabs(IV[i] - U.interval) < fabs(IV[cur] - U.interval)) cur = i;
-        cur += k == ',' ? 1 : -1;
-        if (cur < 0) cur = 0;
-        if (cur >= n) cur = n - 1;
-        U.interval = IV[cur];
-        U.next_sample = now_s() + U.interval;
-        set_msg(0, "Refresh every %.2gs", U.interval);
-        break;
-    }
+    case 'z': toggle_pause(); break;
+    case ',': case '.': step_interval(k); break;
+    case 'g': gpu_open(p); break;
     case 'm': U.compact = !U.compact; break;
     case 'S': relaunch_sudo(); break;
     case '?': case 'h': case K_F(1): U.help = 1; break;
@@ -4095,21 +5806,422 @@ static void splash_progress(size_t done, size_t total)
 }
 
 /* ------------------------------------------------------------------ */
+/* --gpu: GPU telemetry on stdout                                      */
+/* ------------------------------------------------------------------ */
+
+static void jstr(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') fprintf(f, "\\%c", c);
+        else if (c < 0x20) fprintf(f, "\\u%04x", c);
+        else fputc(c, f);
+    }
+    fputc('"', f);
+}
+
+static void jnum(FILE *f, double v, int ok)
+{
+    if (!ok || !isfinite(v)) fputs("null", f);
+    else if (v == floor(v) && fabs(v) < 1e15) fprintf(f, "%.0f", v);
+    else fprintf(f, "%.3f", v);
+}
+
+static void jkey(FILE *f, int *first, const char *k)
+{
+    fprintf(f, "%s\"%s\":", *first ? "" : ",", k);
+    *first = 0;
+}
+
+static void jkv(FILE *f, int *first, const char *k, double v, int ok)
+{
+    jkey(f, first, k);
+    jnum(f, v, ok);
+}
+
+static void jstates(FILE *f, const GStates *st, int skip_idle)
+{
+    int i, first = 1;
+    double act = 0, cact = 0;
+    for (i = 0; i < st->n; i++)
+        if (!skip_idle || strcmp(st->name[i], "IDLE_OFF")) { act += st->res[i]; cact += st->cum[i]; }
+    fputc('{', f);
+    for (i = 0; i < st->n; i++) {
+        if ((skip_idle && !strcmp(st->name[i], "IDLE_OFF")) || st->cum[i] <= 0) continue;
+        fprintf(f, "%s", first ? "" : ",");
+        first = 0;
+        jstr(f, st->name[i]);
+        fputs(":{\"pct\":", f);
+        jnum(f, act > 0 ? st->res[i] / act * 100 : 0, 1);
+        fputs(",\"session_pct\":", f);
+        jnum(f, cact > 0 ? st->cum[i] / cact * 100 : 0, 1);
+        fputc('}', f);
+    }
+    fputc('}', f);
+}
+
+static void gpu_json(FILE *f, unsigned long *ev_out)
+{
+    char ts[40], a[32];
+    time_t t = time(NULL);
+    struct tm tm;
+    uint64_t ml = gpu_mem_limit();
+    unsigned long e;
+    int i, k, first;
+    localtime_r(&t, &tm);
+    strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S%z", &tm);
+    fprintf(f, "{\"time\":\"%s\",\"unix\":%lld,\"interval_s\":", ts, (long long)t);
+    jnum(f, U.interval, 1);
+    fputs(",\"session_s\":", f);
+    jnum(f, G.t_last - G.t_reset, 1);
+    fprintf(f, ",\"samples\":%ld", G.samples);
+
+    fputs(",\"device\":{\"name\":", f);
+    jstr(f, G.name);
+    fprintf(f, ",\"cores\":%d,\"family\":", G.cores);
+    jstr(f, G.family);
+    fputs(",\"driver\":", f);
+    jstr(f, G.driver);
+    fputs(",\"metal_plugin\":", f);
+    jstr(f, G.metal);
+    fputs(",\"max_clock_mhz\":", f);
+    jnum(f, G.fmax, G.nfreq > 0);
+    fputc('}', f);
+
+    fputs(",\"utilization\":{", f);
+    first = 1;
+    jkv(f, &first, "device_pct", S.gpu_util * 100, S.has_gpu);
+    jkv(f, &first, "renderer_pct", S.gpu_rend, S.gpu_rend >= 0);
+    jkv(f, &first, "tiler_pct", S.gpu_tiler, S.gpu_tiler >= 0);
+    jkv(f, &first, "active_residency_pct", G.active_res, G.has_freq);
+    fputc('}', f);
+
+    fputs(",\"clock\":{", f);
+    first = 1;
+    jkv(f, &first, "mhz", G.mhz, G.has_freq && G.nfreq);
+    jkv(f, &first, "max_mhz", G.fmax, G.nfreq > 0);
+    jkey(f, &first, "pstates");
+    fputc('[', f);
+    for (i = 0, k = 0; i < G.ps.n; i++) {
+        int p = gst_pnum(G.ps.name[i]), known = p > 0 && p <= G.nfreq;
+        if (p > 0 && !known && G.ps.cum[i] <= 0) continue; /* states this GPU never uses */
+        fprintf(f, "%s{\"state\":", k++ ? "," : "");
+        jstr(f, G.ps.name[i]);
+        fputs(",\"mhz\":", f);
+        jnum(f, known ? G.freq[p - 1] : 0, known);
+        fputs(",\"pct\":", f);
+        jnum(f, G.ps.tot > 0 ? G.ps.res[i] / G.ps.tot * 100 : 0, G.ps.tot > 0);
+        fputs(",\"session_pct\":", f);
+        jnum(f, G.ps.cumtot > 0 ? G.ps.cum[i] / G.ps.cumtot * 100 : 0, G.ps.cumtot > 0);
+        fputc('}', f);
+    }
+    fputs("]}", f);
+
+    fputs(",\"power\":{", f);
+    first = 1;
+    jkv(f, &first, "gpu_w", G.gpu_w, G.has_gpu_w);
+    jkv(f, &first, "dram_w", G.dram_w, G.has_dram_w);
+    jkv(f, &first, "ane_w", G.ane_w, G.has_ane_w);
+    jkv(f, &first, "cpu_w", G.cpu_w, G.has_cpu_w);
+    jkv(f, &first, "system_w", S.sys_w, S.sys_w >= 0);
+    jkv(f, &first, "gpu_energy_j", G.energy_j, G.has_gpu_w);
+    jkv(f, &first, "dram_energy_j", G.dram_j, G.has_dram_w);
+    jkv(f, &first, "power_target_pct", G.ppm, G.has_ppm);
+    fputc('}', f);
+
+    fputs(",\"temperature\":{", f);
+    first = 1;
+    jkv(f, &first, "avg_c", G.temp, G.has_temp);
+    jkv(f, &first, "max_c", G.tmax, G.has_temp);
+    jkv(f, &first, "session_max_c", G.tmax_peak, G.has_temp);
+    jkv(f, &first, "sensors", G.ntemp, 1);
+    fputc('}', f);
+
+    fputs(",\"memory\":{", f);
+    first = 1;
+    jkv(f, &first, "gpu_in_use_bytes", (double)S.gpu_mem, S.has_gpu);
+    jkv(f, &first, "gpu_allocated_bytes", (double)S.gpu_alloc, S.has_gpu);
+    jkv(f, &first, "gpu_driver_bytes", (double)S.gpu_drv, S.has_gpu);
+    jkv(f, &first, "parameter_buffer_bytes", (double)S.gpu_pb, S.has_gpu);
+    jkv(f, &first, "tiled_scene_bytes", (double)S.gpu_tiled, S.has_gpu);
+    jkv(f, &first, "split_scenes", (double)S.gpu_split, S.has_gpu);
+    jkv(f, &first, "wired_limit_bytes", (double)ml, ml > 0);
+    jkv(f, &first, "in_use_pct_of_wired_limit", ml ? (double)S.gpu_mem / (double)ml * 100 : 0, ml > 0);
+    jkv(f, &first, "system_total_bytes", (double)S.mem_total, 1);
+    jkv(f, &first, "system_used_bytes", (double)S.mem_used, 1);
+    jkv(f, &first, "system_wired_bytes", (double)S.mem_wired, 1);
+    jkv(f, &first, "system_compressed_bytes", (double)S.mem_comp, 1);
+    jkv(f, &first, "swap_used_bytes", (double)S.swap_used, 1);
+    jkey(f, &first, "pressure");
+    jstr(f, pressure_name(S.pressure));
+    fputc('}', f);
+
+    fputs(",\"bandwidth\":{", f);
+    first = 1;
+    jkv(f, &first, "dram_read_gbs", G.bw_rd, G.has_bw);
+    jkv(f, &first, "dram_write_gbs", G.bw_wr, G.has_bw);
+    jkv(f, &first, "dram_total_gbs", G.bw_rd + G.bw_wr, G.has_bw);
+    jkv(f, &first, "gpu_mem_latency_cycles", G.lat, G.has_lat);
+    fputc('}', f);
+
+    fputs(",\"limits\":{", f);
+    first = 1;
+    jkv(f, &first, "limited_pct", gpu_limit(NULL, 0, 0) * 100, G.pc.n > 0);
+    jkv(f, &first, "session_limited_pct", gpu_limit(NULL, 0, 1) * 100, G.pc.n > 0);
+    jkv(f, &first, "thermal_limited_pct", gst_out(&G.cltm, "NO_CLTM", 0) * 100, G.cltm.n > 0);
+    jkv(f, &first, "session_thermal_limited_pct", gst_out(&G.cltm, "NO_CLTM", 1) * 100, G.cltm.n > 0);
+    jkv(f, &first, "pmu_perf_lost_pct", gst_out(&G.pmu, "NONE", 0) * 100, G.pmu.n > 0);
+    jkv(f, &first, "power_zone_pct", gst_out(&G.pz, "NO_ZONE", 0) * 100, G.pz.n > 0);
+    jkv(f, &first, "throttle_events", (double)G.throttle, G.ior);
+    jkv(f, &first, "session_throttle_events", (double)G.throttle_tot, G.ior);
+    jkey(f, &first, "controller");
+    jstates(f, &G.pc, 1);
+    fputc('}', f);
+
+    fputs(",\"health\":{", f);
+    first = 1;
+    jkv(f, &first, "restarts", (double)G.restarts, G.ior);
+    jkv(f, &first, "session_restarts", (double)G.restarts_tot, G.ior);
+    jkv(f, &first, "recovery_count", (double)S.gpu_recov, S.has_gpu);
+    jkv(f, &first, "session_uv_warnings", (double)G.uvwarn_tot, G.ior);
+    fputc('}', f);
+
+    fputs(",\"session\":{", f);
+    for (i = 0; i < GM_N; i++) {
+        const GMet *m = &G.m[i];
+        fprintf(f, "%s\"%s\":", i ? "," : "", GMDEF[i].key);
+        if (!m->n) { fputs("null", f); continue; }
+        fputs("{\"avg\":", f);
+        jnum(f, gm_avg(i), 1);
+        fputs(",\"min\":", f);
+        jnum(f, m->mn, 1);
+        fputs(",\"max\":", f);
+        jnum(f, m->mx, 1);
+        fputs(",\"p95\":", f);
+        jnum(f, m->p95, 1);
+        fputc('}', f);
+    }
+    fputc('}', f);
+
+    fputs(",\"processes\":[", f);
+    for (i = 0, k = 0; i < G.nord; i++) {
+        const GClient *c = &G.cl[G.ord[i]];
+        if (!gcl_match(c, G.query)) continue;
+        fprintf(f, "%s{\"pid\":%d,\"name\":", k++ ? "," : "", c->pid);
+        jstr(f, c->name);
+        fprintf(f, ",\"alive\":%s,\"gpu_pct\":", c->alive ? "true" : "false");
+        jnum(f, c->cur, 1);
+        fputs(",\"avg_pct\":", f);
+        jnum(f, gcl_avg(c), 1);
+        fputs(",\"peak_pct\":", f);
+        jnum(f, c->peak, 1);
+        fputs(",\"gpu_time_s\":", f);
+        jnum(f, (double)c->ns / 1e9, 1);
+        fputs(",\"session_gpu_time_s\":", f);
+        jnum(f, (double)(c->ns - c->ns0) / 1e9, 1);
+        fputs(",\"est_power_w\":", f);
+        jnum(f, c->est_w, G.has_gpu_w && c->alive);
+        fprintf(f, ",\"clients\":%d,\"queues\":%d,\"queues_max\":%d,\"api\":", c->nclients, c->queues, c->qmax);
+        api_str(c->api, a, sizeof a);
+        jstr(f, a);
+        fputs(",\"graphics_footprint_bytes\":", f);
+        jnum(f, (double)c->gfx, c->gfx >= 0);
+        fputs(",\"graphics_footprint_peak_bytes\":", f);
+        jnum(f, (double)c->gfx_peak, c->gfx_peak >= 0);
+        fputs(",\"phys_footprint_bytes\":", f);
+        jnum(f, (double)c->phys, c->phys > 0);
+        fputs(",\"last_submit_ms_ago\":", f);
+        {
+            uint64_t now = tk2ns(mach_absolute_time());
+            jnum(f, now > c->last_sub ? (double)(now - c->last_sub) / 1e6 : 0, c->last_sub > 0 && c->alive);
+        }
+        fputc('}', f);
+    }
+    fputs("],\"events\":[", f);
+    e = G.nev > GNEV && *ev_out < G.nev - GNEV ? G.nev - GNEV : *ev_out;
+    for (k = 0; e < G.nev; e++) {
+        const GEvent *ev = &G.ev[e % GNEV];
+        localtime_r(&ev->t, &tm);
+        strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S%z", &tm);
+        fprintf(f, "%s{\"time\":\"%s\",\"severity\":\"%s\",\"text\":", k++ ? "," : "", ts,
+                ev->sev >= 2 ? "fault" : ev->sev ? "warning" : "info");
+        jstr(f, ev->s);
+        fputc('}', f);
+    }
+    *ev_out = G.nev;
+    fputs("]}\n", f);
+}
+
+static void gpu_text(FILE *f, unsigned long *ev_out)
+{
+    char ts[32], a[32], b[32], c2[32], d[32], st[160];
+    time_t t = time(NULL);
+    struct tm tm;
+    uint64_t ml = gpu_mem_limit();
+    unsigned long e;
+    int i, n;
+    localtime_r(&t, &tm);
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(f, "GPU        %s \xc2\xb7 %d cores \xc2\xb7 %s \xc2\xb7 driver %s \xc2\xb7 %s\n", G.name, G.cores,
+            G.family[0] ? G.family : "-", G.driver[0] ? G.driver : "-", G.metal[0] ? G.metal : "-");
+    fmt_dur(G.t_last - G.t_reset, a, sizeof a);
+    fprintf(f, "sample     %s \xc2\xb7 interval %.2gs \xc2\xb7 sample %ld \xc2\xb7 session %s\n", ts, U.interval, G.samples, a);
+    fprintf(f, "util       device %.0f%%", S.gpu_util * 100);
+    if (S.gpu_rend >= 0) fprintf(f, " \xc2\xb7 renderer %.0f%%", S.gpu_rend);
+    if (S.gpu_tiler >= 0) fprintf(f, " \xc2\xb7 tiler %.0f%%", S.gpu_tiler);
+    if (G.has_freq) fprintf(f, " \xc2\xb7 active residency %.1f%%", G.active_res);
+    fputc('\n', f);
+    if (G.has_freq) {
+        fprintf(f, "clock      ");
+        if (G.nfreq && G.mhz > 0) fprintf(f, "%.0f MHz while active (max %.0f)", G.mhz, G.fmax);
+        else fprintf(f, G.nfreq ? "idle (max %.0f MHz)" : "no frequency table", G.fmax);
+        for (i = 0; i < G.ps.n; i++) {
+            int p = gst_pnum(G.ps.name[i]);
+            double pct = G.ps.tot > 0 ? G.ps.res[i] / G.ps.tot * 100 : 0;
+            if (p <= 0 || pct < 0.5) continue;
+            if (p <= G.nfreq) fprintf(f, " \xc2\xb7 %.0f:%.0f%%", G.freq[p - 1], pct);
+            else fprintf(f, " \xc2\xb7 %s:%.0f%%", G.ps.name[i], pct);
+        }
+        fputc('\n', f);
+    }
+    fmt_power(G.gpu_w, a, sizeof a);
+    fprintf(f, "power      GPU %s", G.has_gpu_w ? a : "n/a");
+    if (G.has_dram_w) { fmt_power(G.dram_w, a, sizeof a); fprintf(f, " \xc2\xb7 DRAM %s", a); }
+    if (G.has_ane_w) { fmt_power(G.ane_w, a, sizeof a); fprintf(f, " \xc2\xb7 ANE %s", a); }
+    if (S.sys_w >= 0) { fmt_power(S.sys_w, a, sizeof a); fprintf(f, " \xc2\xb7 system %s", a); }
+    if (G.has_gpu_w) fprintf(f, " \xc2\xb7 GPU energy %.1f J this session", G.energy_j);
+    if (G.has_ppm) fprintf(f, " \xc2\xb7 power target %.0f%%", G.ppm);
+    fputc('\n', f);
+    if (G.has_temp)
+        fprintf(f, "temp       avg %.1f\xc2\xb0" "C \xc2\xb7 max %.1f\xc2\xb0" "C \xc2\xb7 session max %.1f\xc2\xb0" "C (%d sensors)\n",
+                G.temp, G.tmax, G.tmax_peak, G.ntemp);
+    fmt_mem(S.gpu_mem, a, sizeof a);
+    fmt_mem(S.gpu_alloc, b, sizeof b);
+    fmt_mem(ml, c2, sizeof c2);
+    fprintf(f, "memory     GPU in use %s \xc2\xb7 allocated %s \xc2\xb7 wired limit %s", a, b, ml ? c2 : "macOS default");
+    if (ml) fprintf(f, " (%.0f%% used)", (double)S.gpu_mem / (double)ml * 100);
+    fmt_mem(S.mem_used, a, sizeof a);
+    fmt_mem(S.mem_total, b, sizeof b);
+    fmt_mem(S.swap_used, c2, sizeof c2);
+    fprintf(f, " \xc2\xb7 system %s / %s \xc2\xb7 swap %s \xc2\xb7 pressure %s\n", a, b, c2, pressure_name(S.pressure));
+    if (G.has_bw || G.has_lat) {
+        fprintf(f, "bandwidth  ");
+        if (G.has_bw) fprintf(f, "DRAM read %.1f GB/s \xc2\xb7 write %.1f GB/s \xc2\xb7 total %.1f GB/s", G.bw_rd, G.bw_wr, G.bw_rd + G.bw_wr);
+        if (G.has_lat) fprintf(f, "%sGPU memory latency %.0f cycles", G.has_bw ? " \xc2\xb7 " : "", G.lat);
+        fputc('\n', f);
+    }
+    if (G.ior) {
+        double lf = gpu_limit(st, sizeof st, 0);
+        fprintf(f, "limits     clock limited %.0f%%%s%s%s \xc2\xb7 thermal %.0f%% \xc2\xb7 throttle events %ld \xc2\xb7 restarts %ld (session %ld)",
+                lf * 100, st[0] ? " (" : "", st, st[0] ? ")" : "", gst_out(&G.cltm, "NO_CLTM", 0) * 100, G.throttle,
+                G.restarts, G.restarts_tot);
+        fputs(" \xc2\xb7 controller", f);
+        {
+            double act = 0;
+            for (i = 0; i < G.pc.n; i++)
+                if (strcmp(G.pc.name[i], "IDLE_OFF")) act += G.pc.res[i];
+            for (i = 0, n = 0; i < G.pc.n; i++) {
+                if (!strcmp(G.pc.name[i], "IDLE_OFF") || act <= 0 || G.pc.res[i] / act < 0.005) continue;
+                fprintf(f, " %s %.0f%%", G.pc.name[i], G.pc.res[i] / act * 100);
+                n++;
+            }
+            if (!n) fputs(" idle", f);
+        }
+        fputc('\n', f);
+    }
+    if (G.samples) {
+        fmt_dur(G.t_last - G.t_reset, d, sizeof d);
+        fprintf(f, "session    %s, %ld samples", d, G.samples);
+        for (i = 0; i < GM_N; i++) {
+            if (i == GM_REND || i == GM_TILER || i == GM_TMAX || !G.m[i].n) continue;
+            gm_stats(i, st, sizeof st);
+            fprintf(f, "\n           %-15s %s", GMDEF[i].name, st);
+        }
+        if (G.has_gpu_w) fprintf(f, "\n           %-15s %.1f J (%.4f Wh)", "GPU energy", G.energy_j, G.energy_j / 3600);
+        fputc('\n', f);
+    }
+    fprintf(f, "processes  %7s  %-22s %6s %6s %6s %10s %7s %7s %9s %9s %11s\n", "PID", "NAME", "GPU%", "AVG%", "PEAK%",
+            "GPU TIME", "EST W", "QUEUES", "GFX MEM", "FOOTPRINT", "LAST SUBMIT");
+    for (i = 0, n = 0; i < G.nord; i++) {
+        const GClient *c = &G.cl[G.ord[i]];
+        char q[16];
+        if (!gcl_match(c, G.query) || (!G.query && (n >= 15 || !c->alive))) continue;
+        fmt_cputime(c->ns - c->ns0, a, sizeof a);
+        fmt_power(c->est_w, b, sizeof b);
+        snprintf(q, sizeof q, "%d/%d", c->queues, c->qmax);
+        fmt_mem(c->gfx > 0 ? (uint64_t)c->gfx : 0, c2, sizeof c2);
+        fmt_mem(c->phys, d, sizeof d);
+        fmt_ago(c->alive ? c->last_sub : 0, st, sizeof st);
+        fprintf(f, "           %7d  %-22.22s %6.1f %6.1f %6.1f %10s %7s %7s %9s %9s %11s%s\n", c->pid, c->name, c->cur, gcl_avg(c),
+                c->peak, a, G.has_gpu_w && c->alive ? b : "-", q, c->gfx >= 0 ? c2 : "-", c->phys ? d : "-", st,
+                c->alive ? "" : "  (gone)");
+        n++;
+    }
+    if (!n) fprintf(f, "           (no GPU clients%s)\n", G.query ? " match -p" : "");
+    e = G.nev > GNEV && *ev_out < G.nev - GNEV ? G.nev - GNEV : *ev_out;
+    for (; e < G.nev; e++) {
+        const GEvent *ev = &G.ev[e % GNEV];
+        localtime_r(&ev->t, &tm);
+        strftime(ts, sizeof ts, "%H:%M:%S", &tm);
+        fprintf(f, "event      %s %s%s\n", ts, ev->sev >= 2 ? "FAULT " : ev->sev ? "WARN " : "", ev->s);
+    }
+    *ev_out = G.nev;
+}
+
+/* mhtop --gpu: samples every `interval` seconds and prints `count` reports
+ * (0 = until interrupted). Needs no terminal. */
+static int gpu_cli(int json, long count, double interval, const char *query)
+{
+    unsigned long ev_out = 0;
+    long i;
+    U.interval = interval;
+    G.query = query;
+    sys_init();
+    sample_all(now_s(), NULL);
+    gpu_activate();
+    for (i = 0; count <= 0 || i < count; i++) {
+        double until = now_s() + interval, left;
+        while ((left = until - now_s()) > 0) {
+            struct timespec ts = { (time_t)left, (long)((left - floor(left)) * 1e9) };
+            nanosleep(&ts, NULL);
+        }
+        sample_all(now_s(), NULL);
+        procs_expire(now_s());
+        if (json) gpu_json(stdout, &ev_out);
+        else {
+            if (i) fputc('\n', stdout);
+            gpu_text(stdout, &ev_out);
+        }
+        if (fflush(stdout) != 0 || ferror(stdout)) return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
 static void usage(FILE *f)
 {
     fprintf(f,
-            "usage: " APP " [-d secs] [-s key] [-t] [-u user] [-f filter] [-c] [-M]\n"
+            "usage: " APP " [-d secs] [-s key] [-t] [-u user] [-f filter] [-c] [-M] [-g] [-p pid|name]\n"
+            "       " APP " --gpu [--json] [-d secs] [-n count] [-p pid|name]\n"
             "  Interactive process manager for macOS (htop / Activity Monitor style).\n"
-            "  -d secs   refresh interval (default 1.5)\n"
+            "  -d secs   refresh interval (default 1.5; 1 with --gpu)\n"
             "  -s key    sort: cpu gpu mem power disk time threads pri nice pid user name\n"
             "  -t        start in tree view (parents with their children)\n"
             "  -u user   show only this user's processes (toggle with u)\n"
             "  -f text   initial filter\n"
             "  -c        compact header\n"
             "  -M        disable mouse support (keeps terminal text selection)\n"
+            "  -g        start in the GPU view (g toggles it)\n"
+            "  -p proc   GPU focus: a pid or part of a process name\n"
+            "  --gpu     print GPU telemetry instead of the UI (no terminal needed): utilization,\n"
+            "            clocks, power, temperature, memory, bandwidth, limits, per-process GPU use\n"
+            "            and session stats (avg/min/max/p95); -p keeps only matching processes\n"
+            "  --json    with --gpu: one JSON object per sample (JSON Lines)\n"
+            "  -n count  with --gpu: number of samples (default 1, 0 = until interrupted)\n"
             "  -h        show this help;  -V  print version\n"
             "  Run with sudo to see CPU, memory and power of every user's processes.\n");
 }
@@ -4123,8 +6235,10 @@ static void setup_locale(void)
 int main(int argc, char **argv)
 {
     struct sigaction sa;
-    int i, k;
     double t1;
+    int i, k, gpu_cli_mode = 0, json = 0, start_gpu = 0, have_d = 0;
+    long count = 1;
+    const char *query = NULL;
 
     U.argc = argc;
     U.argv = argv;
@@ -4142,8 +6256,17 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-t")) U.tree = 1;
         else if (!strcmp(a, "-c")) U.compact = 1;
         else if (!strcmp(a, "-M")) g_mouse = 0;
-        else if (!strcmp(a, "-d") && i + 1 < argc) {
+        else if (!strcmp(a, "-g")) start_gpu = 1;
+        else if (!strcmp(a, "--gpu")) gpu_cli_mode = 1;
+        else if (!strcmp(a, "--json")) json = 1;
+        else if (!strcmp(a, "-p") && i + 1 < argc) query = argv[++i];
+        else if (!strcmp(a, "-n") && i + 1 < argc) {
+            char *end;
+            count = strtol(argv[++i], &end, 10);
+            if (*end || count < 0) { fprintf(stderr, APP ": bad count\n"); return 2; }
+        } else if (!strcmp(a, "-d") && i + 1 < argc) {
             U.interval = atof(argv[++i]);
+            have_d = 1;
             if (U.interval < 0.1 || U.interval > 3600) { fprintf(stderr, APP ": bad interval\n"); return 2; }
         } else if (!strcmp(a, "-s") && i + 1 < argc) {
             int s;
@@ -4165,6 +6288,9 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    if (json && !gpu_cli_mode) { fprintf(stderr, APP ": --json needs --gpu\n"); return 2; }
+    if (gpu_cli_mode) return gpu_cli(json, count, have_d ? U.interval : 1.0, query);
+    G.query = query;
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         fprintf(stderr, APP ": needs an interactive terminal\n");
         return 1;
@@ -4200,6 +6326,7 @@ int main(int argc, char **argv)
     U.next_sample = now_s() + U.interval;
     U.pulse_t = U.anim_t0 = now_s();
     rebuild();
+    if (start_gpu || query) gpu_open(NULL);
     SC.full = 1;
 
     for (;;) {
