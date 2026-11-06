@@ -2,7 +2,7 @@ CC      ?= cc
 CFLAGS  ?= -O2
 CFLAGS  += -std=c99 -Wall -Wextra
 LDLIBS  += -lm -framework CoreFoundation -framework IOKit -framework Security -lIOReport
-PREFIX  ?= /usr/local
+PREFIX  ?= $(HOME)/.local
 
 mhtop: mhtop.c
 	$(CC) $(CFLAGS) -o $@ mhtop.c $(LDFLAGS) $(LDLIBS)

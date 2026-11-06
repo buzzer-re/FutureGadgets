@@ -30,6 +30,7 @@ Each folder is self-contained. See its own README or Makefile.
 
 ```sh
 make -C mhtop          # TUI tools: produces ./<tool>/<tool>
+make -C mhtop install  # ... and copies it to ~/.local/bin (PREFIX=/usr/local for /usr/local/bin)
 make -C macdirstat
 Kind/scripts/build-app.sh   # GUI apps: produces Kind/build/Kind.app
 ```

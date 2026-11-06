@@ -2,7 +2,7 @@ CC      ?= cc
 CFLAGS  ?= -O2
 CFLAGS  += -std=c99 -Wall -Wextra -pedantic
 LDLIBS  += -lpthread -lm
-PREFIX  ?= /usr/local
+PREFIX  ?= $(HOME)/.local
 
 macdirstat: macdirstat.c
 	$(CC) $(CFLAGS) -o $@ macdirstat.c $(LDFLAGS) $(LDLIBS)

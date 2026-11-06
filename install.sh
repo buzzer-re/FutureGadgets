@@ -45,8 +45,7 @@ if [ -n "$ROOT" ]; then
   for tool in $TOOLS; do
     [ -f "$ROOT/$tool/Makefile" ] || die "unknown tool: $tool"
     echo "==> $tool (building)"
-    make -s -C "$ROOT/$tool"
-    install -m 755 "$ROOT/$tool/$tool" "$BIN/$tool"
+    make -s -C "$ROOT/$tool" install PREFIX="$PREFIX"
     make -s -C "$ROOT/$tool" clean
     echo "    installed $BIN/$tool"
   done
